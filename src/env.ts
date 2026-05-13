@@ -1,5 +1,37 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/**
+ * Find the .env file by checking cwd first, then the project root
+ * (derived from __dirname which is dist/ in the compiled output).
+ * This ensures agent subprocesses that run with a different cwd
+ * (e.g. agents/product-owner/) can still find the root .env.
+ */
+function findEnvFile(): string | null {
+  // 1. Check cwd (original behaviour)
+  const cwdEnv = path.join(process.cwd(), '.env');
+  if (fs.existsSync(cwdEnv)) return cwdEnv;
+
+  // 2. Check project root via __dirname (dist/env.js -> project root)
+  const rootEnv = path.resolve(__dirname, '..', '.env');
+  if (fs.existsSync(rootEnv)) return rootEnv;
+
+  // 3. Walk up from cwd looking for .env (handles nested agent dirs)
+  let dir = process.cwd();
+  for (let i = 0; i < 5; i++) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+    const candidate = path.join(dir, '.env');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  return null;
+}
 
 /**
  * Parse the .env file and return values for the requested keys.
@@ -8,7 +40,9 @@ import path from 'path';
  * so they don't leak to child processes.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
-  const envFile = path.join(process.cwd(), '.env');
+  const envFile = findEnvFile();
+  if (!envFile) return {};
+
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');

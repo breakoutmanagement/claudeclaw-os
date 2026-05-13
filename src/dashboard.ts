@@ -5,7 +5,7 @@ import { serve } from '@hono/node-server';
 
 import fs from 'fs';
 import path from 'path';
-import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG } from './config.js';
+import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_BIND, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG } from './config.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -2983,7 +2983,7 @@ export function startDashboard(botApi?: Api<RawApi>): void {
   // dashboard-token leak away from full mutation access. Operators who
   // want Cloudflare-tunneled or LAN access opt in via DASHBOARD_BIND in
   // .env (e.g. `DASHBOARD_BIND=0.0.0.0`).
-  const bindHost = (process.env.DASHBOARD_BIND || '127.0.0.1').trim() || '127.0.0.1';
+  const bindHost = DASHBOARD_BIND;
   if (bindHost !== '127.0.0.1' && bindHost !== 'localhost') {
     logger.warn(
       { bindHost, port: DASHBOARD_PORT },

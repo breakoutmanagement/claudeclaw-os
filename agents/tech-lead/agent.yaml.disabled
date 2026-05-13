@@ -1,0 +1,13 @@
+# Agent configuration
+#
+# Then add your bot token to .env:
+#   TECH_LEAD_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent tech-lead
+
+name: Tech Lead
+description: Evaluates development patterns and practices, maintains adopted standards, sets the team's quality bar
+
+telegram_bot_token_env: TECH_LEAD_BOT_TOKEN
+model: claude-sonnet-4-6

@@ -1,0 +1,19 @@
+# Agent configuration
+# Copy this file to agent.yaml and fill in your values.
+#
+# Then add your bot token to .env:
+#   TUTOR_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent tutor
+
+name: Tutor
+description: Patient tutor for a 6th class Polish student covering maths, biology, history, and more
+
+# The env var name in .env that holds this agent's Telegram bot token.
+# Create a bot via @BotFather in Telegram, paste the token into .env.
+telegram_bot_token_env: TUTOR_BOT_TOKEN
+
+# Sonnet is a good balance of speed and quality for tutoring.
+# Upgrade to opus if the student needs help with harder problems.
+model: claude-sonnet-4-6

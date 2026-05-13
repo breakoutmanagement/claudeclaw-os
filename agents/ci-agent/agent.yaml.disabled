@@ -1,0 +1,13 @@
+# Agent configuration
+#
+# Then add your bot token to .env:
+#   CI_AGENT_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent ci-agent
+
+name: CI Agent
+description: Runs builds, tests, and linters. Auto-fixes trivial failures. Quality gate for merges.
+
+telegram_bot_token_env: CI_AGENT_BOT_TOKEN
+model: claude-sonnet-4-6

@@ -1,0 +1,4 @@
+name: Design Audit
+description: Audits landing pages for conversion problems, design consistency, and competitive differentiation
+telegram_bot_token_env: DESIGN_AUDIT_BOT_TOKEN
+model: claude-opus-4-6

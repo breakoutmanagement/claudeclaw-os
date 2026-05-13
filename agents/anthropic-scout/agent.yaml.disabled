@@ -1,0 +1,16 @@
+# Agent configuration
+#
+# This agent runs as a delegation target from main.
+# It does NOT have its own Telegram bot - reports are delivered
+# back through the delegating agent or via scheduled task output.
+#
+# To run standalone (if you add a bot token later):
+#   Add ANTHROPIC_SCOUT_BOT_TOKEN=... to .env
+#   npm start -- --agent anthropic-scout
+#
+# For now, runs as scheduled task on the main agent.
+
+name: Anthropic Scout
+description: Monitors Anthropic GitHub repos daily and reports new repos, updates, and partnership signals relevant to Breakout With AI
+
+model: claude-sonnet-4-6

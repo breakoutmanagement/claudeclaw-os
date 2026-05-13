@@ -1,0 +1,14 @@
+# Agent configuration
+# Copy this file to agent.yaml and fill in your values.
+#
+# Then add your bot token to .env:
+#   DESIGN_SYSTEM_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent design-system
+
+name: Design System
+description: Creates and maintains design.md files - portable design system blueprints for consistent AI-generated output
+
+telegram_bot_token_env: DESIGN_SYSTEM_BOT_TOKEN
+model: claude-sonnet-4-6

@@ -1,0 +1,13 @@
+# Agent configuration
+#
+# Then add your bot token to .env:
+#   CODE_REVIEWER_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent code-reviewer
+
+name: Code Reviewer
+description: Reviews PRs for correctness, security, performance, and convention adherence
+
+telegram_bot_token_env: CODE_REVIEWER_BOT_TOKEN
+model: claude-sonnet-4-6

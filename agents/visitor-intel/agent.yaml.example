@@ -1,0 +1,14 @@
+# Agent configuration
+# Copy this file to agent.yaml and fill in your values.
+#
+# Then add your bot token to .env:
+#   VISITOR_INTEL_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent visitor-intel
+
+name: Visitor Intel
+description: Analyzes website visitor behavior, conversion funnels, and traffic patterns to drive data-backed design decisions
+
+telegram_bot_token_env: VISITOR_INTEL_BOT_TOKEN
+model: claude-sonnet-4-6
