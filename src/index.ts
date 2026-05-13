@@ -2,7 +2,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd, resolveInstructionMd, refreshWarRoomRoster } from './agent-config.js';
-import { createBot } from './bot.js';
+import { createBot, setHookRegistry } from './bot.js';
+import { createHookRegistry, loadHooksFromDir } from './hooks.js';
 import { checkPendingMigrations } from './migrations.js';
 import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT } from './config.js';
 import { startDashboard } from './dashboard.js';
@@ -23,6 +24,10 @@ import { getVenvPython, IS_WINDOWS, killProcess, tmpDir } from './platform.js';
 // Parse --agent flag
 const agentFlagIndex = process.argv.indexOf('--agent');
 const AGENT_ID = agentFlagIndex !== -1 ? process.argv[agentFlagIndex + 1] : 'main';
+
+// Headless mode: runs scheduler + mission tasks without Telegram bot.
+// Use --headless or auto-detected when bot token starts with "placeholder".
+const HEADLESS = process.argv.includes('--headless');
 
 // Export AGENT_ID to env so child processes (schedule-cli, etc.) inherit it
 process.env.CLAUDECLAW_AGENT_ID = AGENT_ID;
@@ -122,13 +127,20 @@ async function main(): Promise<void> {
     showBanner();
   }
 
-  if (!activeBotToken) {
+  // Auto-detect headless: token is placeholder or missing
+  const isHeadless = HEADLESS || !activeBotToken || activeBotToken.startsWith('placeholder');
+
+  if (!activeBotToken && !isHeadless) {
     if (AGENT_ID === 'main') {
       logger.error('Bot token is not set. Run npm run setup to configure it.');
     } else {
       logger.error({ agentId: AGENT_ID }, `Configuration for agent "${AGENT_ID}" is broken: bot token not set. Check .env or re-run npm run agent:create.`);
     }
     process.exit(1);
+  }
+
+  if (isHeadless) {
+    logger.info({ agentId: AGENT_ID }, 'Running in HEADLESS mode (no Telegram, mission tasks only)');
   }
 
   acquireLock();
@@ -153,6 +165,16 @@ async function main(): Promise<void> {
   setAuditCallback((entry) => {
     insertAuditLog(entry.agentId, entry.chatId, entry.action, entry.detail, entry.blocked);
   });
+
+  // Load hooks from hooks/ directory
+  const hookRegistry = createHookRegistry();
+  const hooksDir = path.join(PROJECT_ROOT, 'hooks');
+  await loadHooksFromDir(hooksDir, hookRegistry);
+  setHookRegistry(hookRegistry);
+  const totalHooks = Object.values(hookRegistry).reduce((sum, arr) => sum + arr.length, 0);
+  if (totalHooks > 0) {
+    logger.info({ hooksDir, totalHooks }, 'Hooks loaded');
+  }
 
   initOrchestrator();
 

@@ -1,0 +1,14 @@
+# Agent configuration
+# Copy this file to agent.yaml and fill in your values.
+#
+# Then add your bot token to .env:
+#   LANDING_PAGE_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent landing-page
+
+name: Landing Page
+description: Generates high-conversion landing pages from design.md blueprints and product briefs
+
+telegram_bot_token_env: LANDING_PAGE_BOT_TOKEN
+model: claude-sonnet-4-6

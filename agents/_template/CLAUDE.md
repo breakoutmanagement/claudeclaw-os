@@ -8,6 +8,14 @@ You are a focused specialist agent running as part of a ClaudeClaw multi-agent s
 ## Your Obsidian folders
 [List the vault folders this agent owns, or remove this section if not using Obsidian]
 
+## Memory rules
+
+When creating memories, ALWAYS set `pinned=1`. Pinned memories never decay. This is a standing rule for all agents.
+
+```sql
+INSERT INTO memories (..., pinned, ...) VALUES (..., 1, ...);
+```
+
 ## Hive mind
 After completing any meaningful action (sent an email, created a file, scheduled something, researched a topic), log it to the hive mind so other agents can see what you did:
 

@@ -42,6 +42,13 @@ import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shou
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
+import { runHooks, type HookRegistry } from './hooks.js';
+
+// Hook registry — initialized externally via setHookRegistry()
+let hookRegistry: HookRegistry | null = null;
+export function setHookRegistry(registry: HookRegistry): void {
+  hookRegistry = registry;
+}
 import { buildCostFooter } from './cost-footer.js';
 import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig } from './provider.js';
 import { engineSupportsSystemPrompt } from './agent-engine/index.js';
@@ -237,6 +244,86 @@ function extractSelectionNumber(text: string): number | null {
  * It does NOT support: # headings, ---, - [ ] checkboxes, or most Markdown syntax.
  * This function bridges the gap so Claude's responses render cleanly.
  */
+/**
+ * Convert markdown tables into emoji-led card format for Telegram.
+ *
+ * Input (markdown):
+ *   | # | Video | Words | Relevance |
+ *   |---|-------|-------|-----------|
+ *   | 1 | How To De-Slop | 2.4k | Deep modules |
+ *   | 2 | AFK Factory | 2.5k | Agent orchestration |
+ *
+ * Output (cards):
+ *   1️⃣ <b>How To De-Slop</b>
+ *      Words: 2.4k
+ *      Relevance: Deep modules
+ *
+ *   2️⃣ <b>AFK Factory</b>
+ *      Words: 2.5k
+ *      Relevance: Agent orchestration
+ *
+ * Rules:
+ * - First content column (skipping pure-number columns like #/No) becomes the card title
+ * - Remaining columns become "Header: value" lines
+ * - Row number → circled emoji (1️⃣-🔟), then 🔹 for 11+
+ * - Cells that are empty or just dashes are omitted from the card
+ */
+function convertMarkdownTables(text: string): string {
+  // Match a full markdown table: header row, separator row, then data rows
+  const tableRegex = /(?:^|\n)((?:\|[^\n]+\|\s*\n)\|[\s:|-]+\|\s*\n(?:\|[^\n]+\|\s*\n?)+)/g;
+
+  return text.replace(tableRegex, (match, table: string) => {
+    const lines = table.trim().split('\n').filter((l: string) => l.trim());
+    if (lines.length < 3) return match; // need header + separator + at least 1 row
+
+    // Parse header
+    const parseRow = (line: string): string[] =>
+      line.split('|').map((c: string) => c.trim()).filter((_, i: number, arr: string[]) => i > 0 && i < arr.length - 1);
+
+    const headers = parseRow(lines[0]);
+    // Skip separator line (lines[1])
+    const dataRows = lines.slice(2).map(parseRow);
+
+    if (headers.length === 0 || dataRows.length === 0) return match;
+
+    // Detect which column is a pure index column (#, No, No., number-only)
+    const indexCol = headers.findIndex((h: string) => /^(#|no\.?|\d+)$/i.test(h));
+
+    // First non-index column is the "title" column
+    const titleCol = headers.findIndex((_: string, i: number) => i !== indexCol);
+    if (titleCol === -1) return match;
+
+    // Number emojis for rows
+    const numEmoji = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+
+    const cards = dataRows.map((cells: string[], rowIdx: number) => {
+      // Pad cells if row has fewer columns than header
+      while (cells.length < headers.length) cells.push('');
+
+      const emoji = rowIdx < numEmoji.length ? numEmoji[rowIdx] : '🔹';
+      const title = cells[titleCol] || '(untitled)';
+
+      // Build detail lines from remaining columns
+      const details: string[] = [];
+      for (let i = 0; i < headers.length; i++) {
+        if (i === indexCol || i === titleCol) continue;
+        const val = cells[i];
+        // Skip empty cells, dashes, or whitespace-only
+        if (!val || /^[-–—\s]*$/.test(val)) continue;
+        details.push(`   ${headers[i]}: ${val}`);
+      }
+
+      let card = `${emoji} <b>${title}</b>`;
+      if (details.length > 0) {
+        card += '\n' + details.join('\n');
+      }
+      return card;
+    });
+
+    return '\n' + cards.join('\n\n') + '\n';
+  });
+}
+
 export function formatForTelegram(text: string): string {
   // 1. Extract and protect code blocks before any other processing
   const codeBlocks: string[] = [];
@@ -254,6 +341,12 @@ export function formatForTelegram(text: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+
+  // 2b. Convert markdown tables → emoji-led cards
+  //     Telegram has no table support. We convert each row into a card with
+  //     the first column as a bold header and remaining columns as labeled lines.
+  //     A leading emoji is picked from cell content or auto-assigned by row index.
+  result = convertMarkdownTables(result);
 
   // 3. Inline code (after block extraction)
   const inlineCodes: string[] = [];
@@ -497,6 +590,11 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     'Processing message',
   );
 
+  // Run pre-message hooks (research API guard, scope guard, etc.)
+  if (hookRegistry?.preMessage.length) {
+    await runHooks(hookRegistry.preMessage, { chatId: chatIdStr, agentId: AGENT_ID, message });
+  }
+
   // Emit user message to SSE clients
   emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: message, source: 'telegram' });
 
@@ -732,6 +830,22 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           'Exfiltration guard: redacted secrets from response',
         );
       }
+    }
+
+    // Run post-message hooks (scope guard, cost guard, etc.)
+    if (hookRegistry?.postMessage.length) {
+      await runHooks(hookRegistry.postMessage, {
+        chatId: chatIdStr,
+        agentId: AGENT_ID,
+        message,
+        response: rawResponse,
+        sessionId: result.newSessionId ?? sessionId,
+        usage: result.usage ? {
+          input_tokens: result.usage.inputTokens ?? 0,
+          output_tokens: result.usage.outputTokens ?? 0,
+          cost_usd: result.usage.totalCostUsd ?? 0,
+        } : undefined,
+      });
     }
 
     // Extract file markers before any formatting

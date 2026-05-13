@@ -1,0 +1,14 @@
+# Agent configuration
+# Copy this file to agent.yaml and fill in your values.
+#
+# Then add your bot token to .env:
+#   DESIGN_AUDIT_BOT_TOKEN=1234567890:AAFxxxxxxx
+#
+# Start with:
+#   npm start -- --agent design-audit
+
+name: Design Audit
+description: Audits landing pages for conversion problems, design consistency, and competitive differentiation
+
+telegram_bot_token_env: DESIGN_AUDIT_BOT_TOKEN
+model: claude-sonnet-4-6
