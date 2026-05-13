@@ -6,6 +6,7 @@ import path from 'path';
 import { DB_ENCRYPTION_KEY, STORE_DIR } from './config.js';
 import { cosineSimilarity } from './embeddings.js';
 import { logger } from './logger.js';
+import { MEMORY_POLICY } from './memory-policy.js';
 
 // ── Field-Level Encryption (AES-256-GCM) ────────────────────────────
 // All message bodies (WhatsApp, Slack) are encrypted before storage
@@ -827,8 +828,8 @@ export function saveStructuredMemory(
 ): number {
   const now = Math.floor(Date.now() / 1000);
   const result = db.prepare(
-    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, created_at, accessed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO memories (chat_id, source, raw_text, summary, entities, topics, importance, agent_id, pinned, created_at, accessed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     chatId,
     source,
@@ -838,6 +839,7 @@ export function saveStructuredMemory(
     JSON.stringify(topics),
     importance,
     agentId,
+    MEMORY_POLICY.pinByDefault ? 1 : 0,
     now,
     now,
   );
@@ -998,19 +1000,20 @@ export function saveStructuredMemoryAtomic(
 export function getMemoriesWithEmbeddings(
   chatId: string,
   agentId?: string,
-): Array<{ id: number; embedding: number[]; summary: string; importance: number }> {
+): Array<{ id: number; embedding: number[]; summary: string; importance: number; topics: string[] }> {
   const sql = agentId
-    ? 'SELECT id, embedding, summary, importance FROM memories WHERE chat_id = ? AND agent_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL'
-    : 'SELECT id, embedding, summary, importance FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL';
+    ? 'SELECT id, embedding, summary, importance, topics FROM memories WHERE chat_id = ? AND agent_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL'
+    : 'SELECT id, embedding, summary, importance, topics FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL';
   const params = agentId ? [chatId, agentId] : [chatId];
   const rows = db
     .prepare(sql)
-    .all(...params) as Array<{ id: number; embedding: string; summary: string; importance: number }>;
+    .all(...params) as Array<{ id: number; embedding: string; summary: string; importance: number; topics: string }>;
   return rows.map((r) => ({
     id: r.id,
     embedding: JSON.parse(r.embedding) as number[],
     summary: r.summary,
     importance: r.importance,
+    topics: JSON.parse(r.topics || '[]') as string[],
   }));
 }
 

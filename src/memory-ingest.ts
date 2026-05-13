@@ -1,7 +1,8 @@
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { cosineSimilarity, embedText } from './embeddings.js';
-import { getMemoriesWithEmbeddings, saveStructuredMemoryAtomic } from './db.js';
+import { getMemoriesWithEmbeddings, saveStructuredMemoryAtomic, supersedeMemory } from './db.js';
 import { logger } from './logger.js';
+import { MEMORY_POLICY, topicJaccard } from './memory-policy.js';
 import { readEnvFile } from './env.js';
 import { getScrubbedSdkEnv } from './security.js';
 import { EngineFactory } from './agent-engine/index.js';
@@ -192,26 +193,58 @@ export async function ingestConversationTurn(
     // Clamp importance to valid range
     const importance = Math.max(0, Math.min(1, result.importance));
 
-    // Generate embedding early so we can check for duplicates before saving
-    let embedding: number[] = [];
+    // Fix D: Fail-closed on embedding errors.
+    // Better to lose a memory than create an unsuppressible duplicate.
+    let embedding: number[];
     try {
       const embeddingText = `${result.summary} ${(result.entities ?? []).join(' ')} ${(result.topics ?? []).join(' ')}`;
       embedding = await embedText(embeddingText);
     } catch (embErr) {
-      logger.warn({ err: embErr }, 'Failed to generate embedding for duplicate check');
+      logger.warn({ err: embErr }, 'Embedding generation failed — dropping memory (fail-closed policy)');
+      return false;
     }
 
-    // Duplicate detection: skip if a very similar memory already exists
+    // Fix B+C: Dedup with tighter threshold + Jaccard fallback + supersession.
+    // Instead of silently dropping duplicates, we save the new memory and
+    // mark the old one as superseded, preserving the chain.
+    const newTopics = result.topics ?? [];
     if (embedding.length > 0) {
       const existing = getMemoriesWithEmbeddings(chatId);
       for (const mem of existing) {
         const sim = cosineSimilarity(embedding, mem.embedding);
-        if (sim > 0.85) {
-          logger.debug(
-            { similarity: sim.toFixed(3), existingId: mem.id, newSummary: result.summary.slice(0, 60) },
-            'Skipping duplicate memory',
+        let isDuplicate = sim > MEMORY_POLICY.cosineThreshold;
+
+        // Jaccard fallback for the ambiguous zone
+        if (!isDuplicate && sim > MEMORY_POLICY.cosineJaccardZone) {
+          const jaccard = topicJaccard(newTopics, mem.topics);
+          if (jaccard >= MEMORY_POLICY.jaccardFallback) {
+            isDuplicate = true;
+            logger.debug(
+              { similarity: sim.toFixed(3), jaccard: jaccard.toFixed(3), existingId: mem.id },
+              'Duplicate detected via Jaccard fallback',
+            );
+          }
+        }
+
+        if (isDuplicate) {
+          // Fix C: Supersede instead of drop. Save the new memory, mark old as superseded.
+          const memoryId = saveStructuredMemoryAtomic(
+            chatId,
+            userMessage,
+            result.summary,
+            result.entities ?? [],
+            newTopics,
+            importance,
+            embedding,
+            'conversation',
+            agentId,
           );
-          return false;
+          supersedeMemory(mem.id, memoryId);
+          logger.info(
+            { similarity: sim.toFixed(3), supersededId: mem.id, newId: memoryId, summary: result.summary.slice(0, 60) },
+            'Memory superseded (not dropped)',
+          );
+          return true;
         }
       }
     }
@@ -221,7 +254,7 @@ export async function ingestConversationTurn(
       userMessage,
       result.summary,
       result.entities ?? [],
-      result.topics ?? [],
+      newTopics,
       importance,
       embedding,
       'conversation',
