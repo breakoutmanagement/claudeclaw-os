@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers, modelStatusLine } from './bot.js';
+import { splitMessage, extractFileMarkers, modelStatusLine, isBareCompletion } from './bot.js';
 
 describe('modelStatusLine', () => {
   it('reports Codex model instead of the OpenCode fallback text', () => {
@@ -262,5 +262,34 @@ describe('extractFileMarkers', () => {
     expect(result.text).toContain('Line 1');
     expect(result.text).toContain('Line 2');
     expect(result.text).toContain('Line 3');
+  });
+});
+
+describe('isBareCompletion', () => {
+  it('flags empty / whitespace-only text', () => {
+    expect(isBareCompletion('')).toBe(true);
+    expect(isBareCompletion('   \n  ')).toBe(true);
+  });
+
+  it('flags bare acknowledgements', () => {
+    expect(isBareCompletion('Done.')).toBe(true);
+    expect(isBareCompletion('done')).toBe(true);
+    expect(isBareCompletion('Fixed!')).toBe(true);
+    expect(isBareCompletion('Shipped.')).toBe(true);
+    expect(isBareCompletion('Deployed')).toBe(true);
+    expect(isBareCompletion('OK')).toBe(true);
+    expect(isBareCompletion('All set.')).toBe(true);
+  });
+
+  it('passes replies that contain a bulleted summary', () => {
+    expect(isBareCompletion('Done.\n- shipped v1.11.0\n- closed #32')).toBe(false);
+    expect(isBareCompletion('- fixed the bug\n- redeployed')).toBe(false);
+    expect(isBareCompletion('1. created issue\n2. built feature')).toBe(false);
+    expect(isBareCompletion('✅ deployed\n✅ verified live')).toBe(false);
+  });
+
+  it('passes substantive prose even without bullets', () => {
+    const prose = 'Shipped v1.11.0 to wind-tunnel-preview with the super duck shield and closed issue #32.';
+    expect(isBareCompletion(prose)).toBe(false);
   });
 });

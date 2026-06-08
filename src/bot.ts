@@ -34,6 +34,8 @@ import {
   CLAUDE_MODEL_OPUS,
   CLAUDE_MODEL_SONNET,
   CLAUDE_MODEL_HAIKU,
+  agentDisplayName,
+  agentCostFooter,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
 import { logger } from './logger.js';
@@ -469,6 +471,75 @@ export function extractFileMarkers(text: string): ExtractResult {
 }
 
 /**
+ * Detect a "bare completion" reply: either empty, or a content-free
+ * acknowledgement like "Done." / "Fixed." that carries no bulleted summary of
+ * what actually happened.
+ *
+ * This enforces the standing rule that the agent must always report what it
+ * did (and did not do) as a short bulleted summary, never a lone "Done.".
+ * A reply containing any bullet / numbered / checkbox / status line is treated
+ * as a real summary and passes through untouched.
+ */
+export function isBareCompletion(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return true;
+  // Any bullet, numbered, checkbox, or status line counts as a real summary.
+  if (/(^|\n)\s*([-*•]|\d+[.)]|☐|✅|❌)\s+/.test(t)) return false;
+  // Short, content-free acknowledgements with nothing else attached.
+  if (
+    t.length <= 80 &&
+    /^(done|fixed|shipped|deployed|complete[d]?|ok(ay)?|finished|sorted|all set|on it)\b[\s.!]*$/i.test(t)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+const SUMMARY_REPROMPT =
+  'Your previous reply finished without a proper summary. Reply now, in plain text, ' +
+  'with a short bulleted list (each line starting with "- ") of exactly what you did ' +
+  'and did not do this turn. Do not just say "Done". No preamble, no sign-off.';
+
+/**
+ * Completion guard. If `raw` is a bare completion, do ONE bounded re-prompt
+ * asking the agent for a real bulleted summary. Returns the better text, or a
+ * safe explicit fallback so the user is never left with a content-free "Done.".
+ *
+ * Bounded by construction: at most one extra runAgent call, never recurses.
+ */
+export async function ensureSummary(
+  raw: string,
+  sessionId: string | undefined,
+  model: string | undefined,
+  mcpAllowlist: string[] | undefined,
+): Promise<string> {
+  const original = (raw ?? '').trim();
+  if (!isBareCompletion(original)) return original;
+
+  try {
+    const retry = await runAgent(
+      SUMMARY_REPROMPT,
+      sessionId,
+      () => {},
+      undefined,
+      model,
+      undefined,
+      undefined,
+      mcpAllowlist,
+    );
+    const retryText = retry.text?.trim() ?? '';
+    if (retryText) return retryText;
+  } catch (err) {
+    logger.warn({ err }, 'ensureSummary re-prompt failed');
+  }
+
+  // Could not get a summary. Be explicit rather than fabricating "Done.".
+  return original
+    ? original
+    : 'Finished, but I did not produce a summary of what changed. Ask me to recap if you need the detail.';
+}
+
+/**
  * Send a Telegram typing action. Silently ignores errors (e.g. bot was blocked).
  */
 async function sendTyping(api: Api<RawApi>, chatId: number): Promise<void> {
@@ -815,7 +886,15 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       logger.info({ newSessionId: result.newSessionId }, 'Session saved');
     }
 
-    let rawResponse = result.text?.trim() || 'Done.';
+    // Completion guard: if the model returned empty or a bare "Done."-style
+    // acknowledgement, do one bounded re-prompt to force a real bulleted
+    // summary instead of fabricating a content-free "Done.".
+    let rawResponse = await ensureSummary(
+      result.text ?? '',
+      result.newSessionId ?? sessionId,
+      effectiveModel,
+      agentMcpAllowlist,
+    );
 
     // Exfiltration guard: scan for leaked secrets before sending to Telegram
     if (EXFILTRATION_GUARD_ENABLED) {
@@ -851,8 +930,9 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     // Extract file markers before any formatting
     const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
-    // Add cost footer
-    const costFooter = buildCostFooter(SHOW_COST_FOOTER, result.usage, effectiveModel ?? provider.type);
+    // Add cost footer (per-agent override takes precedence)
+    const effectiveCostFooterMode = (agentCostFooter || SHOW_COST_FOOTER) as import('./config.js').CostFooterMode;
+    const costFooter = buildCostFooter(effectiveCostFooterMode, result.usage, effectiveModel ?? provider.type);
 
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
@@ -1124,7 +1204,8 @@ export function createBot(): Bot {
   bot.command('start', (ctx) => {
     if (ALLOWED_CHAT_ID && !isAuthorised(ctx.chat!.id)) return;
     if (AGENT_ID !== 'main') {
-      return ctx.reply(`${AGENT_ID.charAt(0).toUpperCase() + AGENT_ID.slice(1)} agent online.`);
+      const name = agentDisplayName || AGENT_ID.charAt(0).toUpperCase() + AGENT_ID.slice(1);
+      return ctx.reply(`${name} online.`);
     }
     return ctx.reply('ClaudeClaw online. What do you need?');
   });
@@ -1908,7 +1989,13 @@ async function processDashboardMessage(
       setSession(chatIdStr, result.newSessionId, AGENT_ID);
     }
 
-    const rawResponse = result.text?.trim() || 'Done.';
+    // Completion guard: force a real bulleted summary instead of a bare "Done.".
+    const rawResponse = await ensureSummary(
+      result.text ?? '',
+      result.newSessionId ?? sessionId,
+      agentDefaultModel,
+      agentMcpAllowlist,
+    );
 
     // Save conversation turn
     saveConversationTurn(chatIdStr, text, rawResponse, result.newSessionId ?? sessionId, AGENT_ID);
