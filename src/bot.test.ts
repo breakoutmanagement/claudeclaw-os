@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers, modelStatusLine, isBareCompletion } from './bot.js';
+import { splitMessage, extractFileMarkers, modelStatusLine, isBareCompletion, isProviderLifecycleNoise } from './bot.js';
 
 describe('modelStatusLine', () => {
   it('reports Codex model instead of the OpenCode fallback text', () => {
@@ -293,3 +293,19 @@ describe('isBareCompletion', () => {
     expect(isBareCompletion(prose)).toBe(false);
   });
 });
+describe('isProviderLifecycleNoise', () => {
+  it('flags ACP provider lifecycle task_started descriptions', () => {
+    expect(isProviderLifecycleNoise('acp model set to grok-composer-2.5-fast')).toBe(true);
+    expect(isProviderLifecycleNoise('opencode model set to gpt-4o')).toBe(true);
+    expect(isProviderLifecycleNoise('acp session started')).toBe(true);
+    expect(isProviderLifecycleNoise('gemini session started')).toBe(true);
+  });
+
+  it('passes meaningful task_started descriptions', () => {
+    expect(isProviderLifecycleNoise('Researching buyer dossier')).toBe(false);
+    expect(isProviderLifecycleNoise('Running sub-agent: comms')).toBe(false);
+    expect(isProviderLifecycleNoise(undefined)).toBe(false);
+    expect(isProviderLifecycleNoise('')).toBe(false);
+  });
+});
+

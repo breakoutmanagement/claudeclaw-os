@@ -495,6 +495,17 @@ export function isBareCompletion(text: string): boolean {
   return false;
 }
 
+/**
+ * ACP providers emit task_started progress for internal lifecycle steps
+ * ("acp model set to …", "acp session started"). These are useful on the
+ * dashboard SSE stream but are noise in Telegram — filter them at the
+ * Telegram boundary only.
+ */
+export function isProviderLifecycleNoise(description: string | undefined): boolean {
+  const desc = description ?? '';
+  return / model set to /.test(desc) || /session started$/.test(desc);
+}
+
 const SUMMARY_REPROMPT =
   'Your previous reply finished without a proper summary. Reply now, in plain text, ' +
   'with a short bulleted list (each line starting with "- ") of exactly what you did ' +
@@ -780,7 +791,9 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       };
       if (event.type === 'task_started') {
         emitChatEvent(progressPayload);
-        void ctx.reply(`🔄 ${event.description}`).catch(() => {});
+        if (!isProviderLifecycleNoise(event.description)) {
+          void ctx.reply(`🔄 ${event.description}`).catch(() => {});
+        }
       } else if (event.type === 'task_completed') {
         emitChatEvent(progressPayload);
         // Only notify Telegram for meaningful completions (sub-agent results),
