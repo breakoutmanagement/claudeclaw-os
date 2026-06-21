@@ -116,7 +116,13 @@ function acquireLock(): void {
 }
 
 function releaseLock(): void {
-  try { fs.unlinkSync(PID_FILE); } catch { /* ignore */ }
+  // Only remove the pidfile if it still points at us. Prevents a dying process
+  // from deleting the pidfile a successor already claimed (which left the
+  // dashboard's isProcessAlive() check pointing at a dead PID).
+  try {
+    const cur = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+    if (cur === process.pid) fs.unlinkSync(PID_FILE);
+  } catch { /* ignore */ }
 }
 
 async function main(): Promise<void> {
@@ -155,6 +161,24 @@ async function main(): Promise<void> {
     process.exit(1);
   }
   logger.info('Database ready');
+
+  // Optional overlay/plugin bootstrap. A layered deployment can point
+  // OVERLAY_ENTRY at a module whose `bootstrap` (or default) export registers
+  // hooks, command handlers, or tool gates before the bot starts. Unset (the
+  // default) means pure upstream behaviour.
+  const overlayEntry = process.env.OVERLAY_ENTRY;
+  if (overlayEntry) {
+    try {
+      const mod = await import(overlayEntry);
+      await (mod.bootstrap ?? mod.default)?.();
+      logger.info({ overlayEntry }, 'Overlay bootstrap loaded');
+    } catch (err) {
+      logger.warn(
+        { overlayEntry, err: err instanceof Error ? err.message : String(err) },
+        'Overlay bootstrap failed to load',
+      );
+    }
+  }
 
   // Initialize security (PIN lock, kill phrase, destructive confirmation, audit)
   initSecurity({
@@ -237,7 +261,6 @@ async function main(): Promise<void> {
 
       if (fs.existsSync(venvPython) && fs.existsSync(serverScript)) {
         // Pre-flight: verify Python dependencies are actually installed
-
         const depCheck = spawnSync(venvPython, ['-c', 'import pipecat'], { stdio: 'pipe', timeout: 10000, windowsHide: true });
         if (depCheck.status !== 0) {
           const msg = uvAvailable

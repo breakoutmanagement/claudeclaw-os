@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { splitMessage, extractFileMarkers, modelStatusLine, isBareCompletion, isProviderLifecycleNoise } from './bot.js';
+import { splitMessage, extractFileMarkers, modelStatusLine, isBareCompletion, isProviderLifecycleNoise, registerCommandHandler } from './bot.js';
 
 describe('modelStatusLine', () => {
   it('reports Codex model instead of the OpenCode fallback text', () => {
@@ -309,3 +309,11 @@ describe('isProviderLifecycleNoise', () => {
   });
 });
 
+
+describe('registerCommandHandler', () => {
+  it('is exported and accepts an overlay command handler without throwing', () => {
+    expect(() =>
+      registerCommandHandler({ name: 'dpp', handler: async () => true }),
+    ).not.toThrow();
+  });
+});
