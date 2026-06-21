@@ -26,6 +26,7 @@ const SCRAPE_PATTERNS = [
 
 // Agents that should always use the research API
 const RESEARCH_FIRST_AGENTS = [
+  'grokeroobot',
   'design-system',
   'landing-page',
   'design-audit',

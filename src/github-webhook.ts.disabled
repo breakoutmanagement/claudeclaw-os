@@ -1,0 +1,462 @@
+/**
+ * GitHub Webhook Receiver for cross-agent comms.
+ *
+ * Closes the canonical-bus loop: when an agent (or user) comments
+ * `@PObot ...` on a GitHub issue/PR in an allow-listed repo, the
+ * target agent gets auto-triggered with the thread context.
+ *
+ * Features:
+ *   - HMAC-SHA256 payload verification
+ *   - @mention and [agent:role] parsing
+ *   - Repo allow-list enforcement
+ *   - De-dup on (delivery_id, comment_id)
+ *   - Loop guard: max N mentions per thread/agent/hour
+ *   - hive_mind audit row per trigger
+ *   - Queues mission tasks for offline agents
+ */
+
+import crypto from 'crypto';
+
+import {
+  GITHUB_WEBHOOK_SECRET,
+  GITHUB_WEBHOOK_REPOS,
+  GITHUB_WEBHOOK_AGENTS,
+  ALLOWED_CHAT_ID,
+} from './config.js';
+import {
+  isWebhookDeliveryProcessed,
+  recordWebhookDelivery,
+  updateWebhookDeliveryStatus,
+  countRecentAgentMentionsOnThread,
+  logToHiveMind,
+  createMissionTask,
+} from './db.js';
+import { logger } from './logger.js';
+
+// ── Constants ────────────────────────────────────────────────────────
+
+/** Max agent mentions per thread per hour per agent. */
+const LOOP_GUARD_MAX = 10;
+const LOOP_GUARD_WINDOW_SECONDS = 3600;
+
+/** Supported GitHub event types. */
+const SUPPORTED_EVENTS = new Set([
+  'issue_comment',
+  'pull_request_review_comment',
+  'pull_request_review',
+  'issues',
+]);
+
+// ── Types ────────────────────────────────────────────────────────────
+
+export interface WebhookResult {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+export interface ParsedMention {
+  mentionName: string; // e.g. "PObot" (original case)
+  agentId: string;     // e.g. "product-owner"
+  prompt: string;      // text after the mention
+}
+
+interface IssueContext {
+  title: string;
+  number: number;
+  url: string;
+  body: string;
+}
+
+interface CommentContext {
+  id: number;
+  body: string;
+  user: string;
+  url: string;
+}
+
+// ── Payload Verification ─────────────────────────────────────────────
+
+/**
+ * Verify the GitHub webhook signature (X-Hub-Signature-256).
+ * Returns true if the HMAC matches, false otherwise.
+ */
+export function verifySignature(
+  payload: string | Buffer,
+  signature: string | undefined,
+  secret: string = GITHUB_WEBHOOK_SECRET,
+): boolean {
+  if (!secret) {
+    logger.warn('GITHUB_WEBHOOK_SECRET not configured, rejecting webhook');
+    return false;
+  }
+  if (!signature) return false;
+
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', secret)
+    .update(payload)
+    .digest('hex');
+
+  // Constant-time comparison
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expected),
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ── Mention Parsing ──────────────────────────────────────────────────
+
+/**
+ * Extract @mentions and [agent:role] tags from comment body.
+ * Matches against the configured GITHUB_WEBHOOK_AGENTS map.
+ *
+ * Supported patterns:
+ *   @PObot do the thing
+ *   @PObot: do the thing
+ *   [agent:product-owner] do the thing
+ */
+export function parseMentions(
+  body: string,
+  agentMap: Record<string, string> = GITHUB_WEBHOOK_AGENTS,
+): ParsedMention[] {
+  const mentions: ParsedMention[] = [];
+  const seen = new Set<string>();
+
+  // Pattern 1: @BotName with optional colon and trailing text
+  // Match @word at the start of a line or after whitespace
+  const atRegex = /@(\w[\w-]*)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = atRegex.exec(body)) !== null) {
+    const mentionName = match[1];
+    const lowerName = mentionName.toLowerCase();
+    const agentId = agentMap[lowerName];
+    if (agentId && !seen.has(agentId)) {
+      seen.add(agentId);
+      // Extract the text after this mention as the prompt
+      const afterMention = body.slice(match.index + match[0].length).replace(/^:\s*/, '').trim();
+      mentions.push({
+        mentionName,
+        agentId,
+        prompt: afterMention || body,
+      });
+    }
+  }
+
+  // Pattern 2: [agent:role] syntax
+  const bracketRegex = /\[agent:(\w[\w-]*)\]/g;
+  while ((match = bracketRegex.exec(body)) !== null) {
+    const role = match[1];
+    // Direct agent ID match (the role IS the agent ID)
+    const agentId = Object.values(agentMap).includes(role) ? role : agentMap[role.toLowerCase()];
+    if (agentId && !seen.has(agentId)) {
+      seen.add(agentId);
+      const afterTag = body.slice(match.index + match[0].length).trim();
+      mentions.push({
+        mentionName: `[agent:${role}]`,
+        agentId,
+        prompt: afterTag || body,
+      });
+    }
+  }
+
+  return mentions;
+}
+
+// ── Event Extraction ─────────────────────────────────────────────────
+
+/**
+ * Extract issue/PR context + comment from a webhook payload.
+ * Returns null for unsupported or irrelevant events.
+ */
+export function extractEventContext(
+  eventType: string,
+  action: string | undefined,
+  payload: Record<string, any>,
+): { issue: IssueContext; comment: CommentContext; repo: string } | null {
+  // Filter to supported actions
+  if (eventType === 'issue_comment' && action !== 'created') return null;
+  if (eventType === 'pull_request_review_comment' && action !== 'created') return null;
+  if (eventType === 'pull_request_review' && action !== 'submitted') return null;
+  if (eventType === 'issues' && action !== 'opened') return null;
+
+  const repo = payload.repository?.full_name?.toLowerCase() ?? '';
+
+  // Extract issue/PR context
+  const issueOrPr = payload.issue || payload.pull_request;
+  if (!issueOrPr) return null;
+
+  const issue: IssueContext = {
+    title: issueOrPr.title ?? '',
+    number: issueOrPr.number ?? 0,
+    url: issueOrPr.html_url ?? '',
+    body: (issueOrPr.body ?? '').slice(0, 2000), // cap body size
+  };
+
+  // Extract comment
+  let comment: CommentContext;
+
+  if (eventType === 'issues' && action === 'opened') {
+    // For new issues, the "comment" is the issue body itself
+    comment = {
+      id: issueOrPr.id ?? 0,
+      body: issueOrPr.body ?? '',
+      user: issueOrPr.user?.login ?? '',
+      url: issueOrPr.html_url ?? '',
+    };
+  } else if (eventType === 'pull_request_review') {
+    const review = payload.review;
+    if (!review) return null;
+    comment = {
+      id: review.id ?? 0,
+      body: review.body ?? '',
+      user: review.user?.login ?? '',
+      url: review.html_url ?? '',
+    };
+  } else {
+    const c = payload.comment;
+    if (!c) return null;
+    comment = {
+      id: c.id ?? 0,
+      body: c.body ?? '',
+      user: c.user?.login ?? '',
+      url: c.html_url ?? '',
+    };
+  }
+
+  return { issue, comment, repo };
+}
+
+// ── Build Agent Prompt ───────────────────────────────────────────────
+
+/**
+ * Build the prompt that will be sent to the target agent.
+ * Includes full thread context so the agent can respond intelligently.
+ */
+export function buildAgentPrompt(
+  issue: IssueContext,
+  comment: CommentContext,
+  mention: ParsedMention,
+  repo: string,
+): string {
+  const lines = [
+    `[GitHub webhook trigger]`,
+    `You were mentioned by @${comment.user} on ${repo}#${issue.number}.`,
+    ``,
+    `Issue: ${issue.title}`,
+    `URL: ${issue.url}`,
+    ``,
+    `--- Issue body (truncated) ---`,
+    issue.body.slice(0, 1500),
+    `--- End issue body ---`,
+    ``,
+    `--- Comment that mentioned you ---`,
+    `Author: @${comment.user}`,
+    `Comment URL: ${comment.url}`,
+    ``,
+    comment.body,
+    `--- End comment ---`,
+    ``,
+    `Respond by posting a comment on the GitHub issue/PR above.`,
+    `Use: gh issue comment ${issue.number} --repo ${repo} --body "YOUR RESPONSE"`,
+    `Or for PR review comments, use the appropriate gh command.`,
+    ``,
+    `Rules:`,
+    `- Stay on topic. Only address what was asked in the mention.`,
+    `- Reference the issue/PR context in your response.`,
+    `- Keep your response focused and actionable.`,
+    `- Do NOT tag other agents unless explicitly asked to.`,
+  ];
+
+  return lines.join('\n');
+}
+
+// ── Main Handler ─────────────────────────────────────────────────────
+
+/**
+ * Process a GitHub webhook delivery end-to-end.
+ *
+ * Steps:
+ *   1. Verify signature
+ *   2. Validate event type
+ *   3. Check repo allow-list
+ *   4. Extract event context
+ *   5. Parse mentions
+ *   6. De-dup check
+ *   7. Loop guard check
+ *   8. Create mission task for target agent
+ *   9. Log to hive_mind
+ */
+export async function handleGithubWebhook(
+  rawBody: string | Buffer,
+  headers: {
+    'x-hub-signature-256'?: string;
+    'x-github-event'?: string;
+    'x-github-delivery'?: string;
+  },
+): Promise<WebhookResult> {
+  const eventType = headers['x-github-event'] ?? '';
+  const deliveryId = headers['x-github-delivery'] ?? crypto.randomUUID();
+  const signature = headers['x-hub-signature-256'];
+
+  // 1. Verify signature
+  if (!verifySignature(rawBody, signature)) {
+    logger.warn({ deliveryId, eventType }, 'GitHub webhook signature verification failed');
+    return { status: 401, body: { error: 'Invalid signature' } };
+  }
+
+  // 2. Validate event type
+  if (!SUPPORTED_EVENTS.has(eventType)) {
+    return { status: 200, body: { ok: true, skipped: true, reason: `Unsupported event: ${eventType}` } };
+  }
+
+  // 3. Parse payload
+  let payload: Record<string, any>;
+  try {
+    payload = JSON.parse(typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8'));
+  } catch {
+    return { status: 400, body: { error: 'Invalid JSON payload' } };
+  }
+
+  const action = payload.action as string | undefined;
+
+  // 4. Extract event context
+  const ctx = extractEventContext(eventType, action, payload);
+  if (!ctx) {
+    return { status: 200, body: { ok: true, skipped: true, reason: 'No actionable context' } };
+  }
+
+  // 5. Check repo allow-list
+  if (GITHUB_WEBHOOK_REPOS.length > 0 && !GITHUB_WEBHOOK_REPOS.includes(ctx.repo)) {
+    logger.info({ repo: ctx.repo, deliveryId }, 'Webhook from non-allow-listed repo, skipping');
+    return { status: 200, body: { ok: true, skipped: true, reason: `Repo not in allow-list: ${ctx.repo}` } };
+  }
+
+  // 6. Parse mentions
+  const mentions = parseMentions(ctx.comment.body);
+  if (mentions.length === 0) {
+    return { status: 200, body: { ok: true, skipped: true, reason: 'No recognized agent mentions' } };
+  }
+
+  // 7. Process each mention
+  const results: Array<{ agent: string; status: string; reason?: string }> = [];
+
+  for (const mention of mentions) {
+    const commentId = String(ctx.comment.id);
+
+    // De-dup check
+    if (isWebhookDeliveryProcessed(deliveryId, `${commentId}-${mention.agentId}`)) {
+      results.push({ agent: mention.agentId, status: 'skipped', reason: 'duplicate' });
+      continue;
+    }
+
+    // Loop guard
+    const recentCount = countRecentAgentMentionsOnThread(
+      ctx.issue.url,
+      mention.agentId,
+      LOOP_GUARD_WINDOW_SECONDS,
+    );
+    if (recentCount >= LOOP_GUARD_MAX) {
+      const recorded = recordWebhookDelivery(
+        deliveryId, eventType, ctx.repo, `${commentId}-${mention.agentId}`,
+        ctx.issue.url, mention.agentId, mention.prompt.slice(0, 500), 'skipped',
+      );
+      if (recorded) {
+        updateWebhookDeliveryStatus(
+          deliveryId, `${commentId}-${mention.agentId}`,
+          'skipped', `Loop guard: ${recentCount}/${LOOP_GUARD_MAX} mentions in last hour`,
+        );
+      }
+      logger.warn(
+        { agent: mention.agentId, thread: ctx.issue.url, count: recentCount },
+        'Loop guard triggered',
+      );
+      results.push({
+        agent: mention.agentId,
+        status: 'skipped',
+        reason: `Loop guard: ${recentCount} mentions in last hour (max ${LOOP_GUARD_MAX})`,
+      });
+      continue;
+    }
+
+    // Record delivery
+    const recorded = recordWebhookDelivery(
+      deliveryId, eventType, ctx.repo, `${commentId}-${mention.agentId}`,
+      ctx.issue.url, mention.agentId, mention.prompt.slice(0, 500),
+    );
+    if (!recorded) {
+      results.push({ agent: mention.agentId, status: 'skipped', reason: 'duplicate' });
+      continue;
+    }
+
+    // Build agent prompt
+    const prompt = buildAgentPrompt(ctx.issue, ctx.comment, mention, ctx.repo);
+
+    // Create mission task for the target agent
+    const taskId = `gh-${deliveryId.slice(0, 8)}-${mention.agentId}`;
+    try {
+      createMissionTask(
+        taskId,
+        `GitHub: @${mention.mentionName} on ${ctx.repo}#${ctx.issue.number}`,
+        prompt,
+        mention.agentId,
+        'github-webhook',
+        7, // higher priority than default
+      );
+
+      updateWebhookDeliveryStatus(
+        deliveryId, `${commentId}-${mention.agentId}`, 'queued',
+      );
+
+      // Audit row in hive_mind
+      logToHiveMind(
+        mention.agentId,
+        ALLOWED_CHAT_ID || 'webhook',
+        'github_webhook_trigger',
+        `Triggered by @${ctx.comment.user} on ${ctx.repo}#${ctx.issue.number}: ${mention.prompt.slice(0, 120)}`,
+        JSON.stringify({
+          delivery_id: deliveryId,
+          comment_id: commentId,
+          thread_url: ctx.issue.url,
+          mention: mention.mentionName,
+          comment_user: ctx.comment.user,
+        }),
+      );
+
+      logger.info(
+        {
+          agent: mention.agentId,
+          repo: ctx.repo,
+          issue: ctx.issue.number,
+          commentUser: ctx.comment.user,
+          taskId,
+        },
+        'GitHub webhook routed to agent',
+      );
+
+      results.push({ agent: mention.agentId, status: 'queued' });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      updateWebhookDeliveryStatus(
+        deliveryId, `${commentId}-${mention.agentId}`, 'failed', errMsg,
+      );
+      logger.error({ err: errMsg, agent: mention.agentId }, 'Failed to create mission task from webhook');
+      results.push({ agent: mention.agentId, status: 'failed', reason: errMsg });
+    }
+  }
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      delivery_id: deliveryId,
+      event: eventType,
+      repo: ctx.repo,
+      issue: ctx.issue.number,
+      mentions: results,
+    },
+  };
+}

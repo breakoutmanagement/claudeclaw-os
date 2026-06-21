@@ -1,0 +1,16 @@
+# Agent configuration for Grokero (@grokeroobot)
+#
+# UI/UX graphic designer powered by Grok subscription (grok-composer-2.5-fast).
+# Start with: npm start -- --agent grokeroobot
+
+name: Grokero
+description: UI/UX graphic designer. Design systems, landing pages, visual assets, and conversion audits. Runs on @grokeroobot.
+
+telegram_bot_token_env: GROKEROOBOT_BOT_TOKEN
+
+provider:
+  type: acp
+  command: /home/ccaudit/.local/bin/grok
+  args: ["--always-approve", "agent", "stdio"]
+  model: grok-composer-2.5-fast
+  dangerouslySkipPermissions: true

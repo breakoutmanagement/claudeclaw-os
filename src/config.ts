@@ -54,6 +54,8 @@ export let agentProvider: ProviderConfig | undefined; // from agent.yaml/main-co
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
 export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
+export let agentDisplayName: string | undefined; // from agent.yaml display name
+export let agentCostFooter: CostFooterMode | undefined; // per-agent cost footer override
 
 export function setAgentOverrides(opts: {
   agentId: string;
@@ -64,6 +66,8 @@ export function setAgentOverrides(opts: {
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
   mcpServers?: string[];
+  displayName?: string;
+  costFooter?: CostFooterMode;
 }): void {
   AGENT_ID = opts.agentId;
   activeBotToken = opts.botToken;
@@ -73,6 +77,8 @@ export function setAgentOverrides(opts: {
   agentObsidianConfig = opts.obsidian;
   agentSystemPrompt = opts.systemPrompt;
   agentMcpAllowlist = opts.mcpServers;
+  agentDisplayName = opts.displayName;
+  agentCostFooter = opts.costFooter;
 }
 
 /** Update just the system prompt (CLAUDE.md content). Used by the

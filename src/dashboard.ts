@@ -168,6 +168,8 @@ const CLAUDE_MODEL_OPTIONS = VALID_CLAUDE_MODELS.map((id) => ({
 const GEMINI_MODEL_OPTIONS = [
   { id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
   { id: 'gemini-3-flash', label: 'Gemini 3 Flash' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
   { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
   { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
 ];
