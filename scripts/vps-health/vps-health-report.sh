@@ -21,17 +21,21 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$REPORTS/vps-health-$STAMP.html"
 JSON="$REPORTS/vps-health-$STAMP.json"
 
+# Live targets are pulled directly (assistant has ACL access to these).
+# Prod boxes (breakoutclaw-prod, buddy-breakout-prod) report via agentless push:
+# each runs deploy/push-local-health.sh on its own cron -> Taildrop -> intake dir.
+INTAKE="${VPS_HEALTH_INTAKE:-$HOME/health-intake}"
+mkdir -p "$INTAKE"
+
+# pull any freshly Taildropped JSON into the intake dir (no-op if none waiting)
+tailscale file get "$INTAKE" >/dev/null 2>&1 || true
+
 python3 "$DIR/collect_and_render.py" \
   --out "$OUT" \
   --json "$JSON" \
+  --intake "$INTAKE" \
   --target "ts-cc-os-vanilla (agents)=local" \
-  --target "trading-desk-lon1=trading-desk-lon1" \
-  --target "breakoutclaw-prod=breakoutclaw-prod" \
-  --target "buddy-breakout-prod=buddy-breakout-prod"
-  # NOTE: the two prod boxes will render OFFLINE until the assistant has SSH
-  # access. That needs either (a) tagging them + an ACL grant tag:assistant->
-  # tag:<prod> tcp:22, or (b) the agentless push model (collector runs locally
-  # on each box via its own cron, writing JSON the report aggregates).
+  --target "trading-desk-lon1=trading-desk-lon1"
 
 # keep a stable "latest" pointer
 ln -sf "$OUT"  "$REPORTS/latest.html"

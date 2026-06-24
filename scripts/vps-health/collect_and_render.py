@@ -172,8 +172,13 @@ def render(hosts, generated):
             e = PROC_EMOJI.get(p["comm"], "🔧")
             ptiles += tile(f"<div class='t'><span>{e} {html.escape(p['comm'])}</span></div>"
                            f"<div class='m'><span>⚙️ {html.escape(p['cpu'])}%</span><span>🧠 {html.escape(p['mem'])}%</span></div>")
+        push_badge = ""
+        if "pushed_age_min" in d:
+            am = d["pushed_age_min"]
+            fresh = "🟢" if am < 720 else ("🟡" if am < 2880 else "🔴")
+            push_badge = f"<span class='meta'>{fresh} 📥 pushed {am} min ago</span>"
         block = (f"<div class='host'><div class='hdr'><span class='name'>🟢 {html.escape(d['label'])}</span>"
-                 f"<span class='meta'>{html.escape(d['host'])}</span></div>"
+                 f"<span class='meta'>{html.escape(d['host'])}</span>{push_badge}</div>"
                  f"<div class='statbar'>{statbar}</div>")
         if ctiles:
             block += f"<h2>📦 Containers ({len(run_c)} up{', '+str(len(stop_c))+' stopped' if stop_c else ''})</h2><div class='grid'>{ctiles}</div>"
@@ -186,11 +191,22 @@ def render(hosts, generated):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None)
     ap.add_argument("--json", default=None)
     ap.add_argument("--target", action="append", default=[],
                     help='label=host  (host "local" or a tailscale name)')
+    ap.add_argument("--intake", default=None,
+                    help="directory of pushed per-host JSON files to ingest (agentless push)")
+    ap.add_argument("--emit-host", default=None,
+                    help="collect THIS host locally and print one host-dict JSON to stdout, then exit")
     args = ap.parse_args()
+
+    # agentless push: a prod box emits its own single-host JSON for Taildrop
+    if args.emit_host:
+        print(json.dumps(collect(args.emit_host, "local")))
+        return
+    if not args.out:
+        ap.error("--out is required unless --emit-host is used")
     targets = args.target or [
         "ts-cc-os-vanilla (agents)=local",
         "trading-desk-lon1=trading-desk-lon1",
@@ -199,6 +215,19 @@ def main():
     for t in targets:
         label, _, host = t.partition("=")
         hosts.append(collect(label.strip(), host.strip()))
+    # ingest agentless-push JSON (one host-dict per file), freshest wins by label
+    if args.intake:
+        import glob, os
+        seen = {h["label"] for h in hosts}
+        for fp in sorted(glob.glob(os.path.join(args.intake, "*.json"))):
+            try:
+                hd = json.load(open(fp))
+                if isinstance(hd, dict) and hd.get("label") and hd["label"] not in seen:
+                    age_min = int((datetime.datetime.now().timestamp() - os.path.getmtime(fp)) / 60)
+                    hd["pushed_age_min"] = age_min
+                    hosts.append(hd); seen.add(hd["label"])
+            except Exception:
+                continue
     generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
     htmlout = render(hosts, generated)
     with open(args.out, "w") as f:
