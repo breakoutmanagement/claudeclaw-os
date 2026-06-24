@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
+import { listEntries as bunkerList, listArchived as bunkerArchivedList, setPinned as bunkerSetPinned, archiveEntry as bunkerArchive, promoteEntry as bunkerPromote, resolveArtifact as bunkerResolveArtifact, verifyArtifact as bunkerVerifyArtifact } from './bunker.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -543,6 +544,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       await next();
       return;
     }
+    // Bunker artifact files carry their OWN per-slug scoped capability
+    // (?t=&exp=, verified in the handler), so they must NOT require the master
+    // token — that's the whole point of not shipping the master token inside
+    // artifact URLs. Everything else under /api/ still requires it.
+    if (path.startsWith('/api/bunker-files/')) {
+      await next();
+      return;
+    }
     const token = c.req.query('token');
     if (!safeTokenEqual(token, DASHBOARD_TOKEN)) {
       return c.json({ error: 'Unauthorized' }, 401);
@@ -840,6 +849,68 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // unified resolver in avatars.ts.
 
   // War Room API: meeting state management.
+  // ── Bunker (ad-hoc report surface) ─────────────────────────────
+  // Drop an HTML artifact into ~/.claudeclaw/bunker/<slug>/ (helper:
+  // scripts/bunker-add.mjs) and it appears here, served from the
+  // dashboard origin — no throwaway localhost ports to hunt down. Gated by
+  // the /api token middleware; mutations respect the kill-switch.
+  app.get('/api/bunker', (c) => {
+    // DASHBOARD_TOKEN keys the per-entry scoped artifact capabilities.
+    return c.json({ entries: bunkerList(DASHBOARD_TOKEN), archived: bunkerArchivedList(DASHBOARD_TOKEN) });
+  });
+
+  app.post('/api/bunker/:slug/pin', async (c) => {
+    const body: { pinned?: boolean } = await c.req.json().catch(() => ({}));
+    if (!bunkerSetPinned(c.req.param('slug'), body.pinned !== false)) {
+      return c.json({ error: 'Bunker entry not found' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/bunker/:slug/archive', (c) => {
+    if (!bunkerArchive(c.req.param('slug'))) {
+      return c.json({ error: 'Bunker entry not found' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  // Promote: copy the artifact into the vault as a searchable markdown note.
+  app.post('/api/bunker/:slug/promote', (c) => {
+    const result = bunkerPromote(c.req.param('slug'));
+    if (!result) return c.json({ error: 'Bunker entry not found' }, 404);
+    return c.json({ ok: true, vaultPath: result.vaultPath });
+  });
+
+  // Serve the artifact files themselves. NOT gated by the master /api token
+  // (exempted above); instead each request must carry a per-slug scoped
+  // capability (?t=&exp=) minted by the list endpoint. Opened in a NEW TAB —
+  // the global X-Frame-Options: DENY header makes inline framing impossible.
+  app.get('/api/bunker-files/*', (c) => {
+    const pathname = new URL(c.req.url).pathname;
+    const sub = pathname.replace(/^\/api\/bunker-files\//, '');
+
+    // Bind the capability to the slug: first path segment after an optional
+    // _archive/ prefix. Mirrors resolveArtifact's prefix handling so a token
+    // signed for slug A cannot read slug B (or _archive/A vs A).
+    let slugPath = sub.replace(/^\/+/, '');
+    if (slugPath === '_archive' || slugPath.startsWith('_archive/')) {
+      slugPath = slugPath.slice('_archive'.length).replace(/^\/+/, '');
+    }
+    const slug = decodeURIComponent(slugPath.split('/')[0] ?? '');
+
+    const t = c.req.query('t') ?? '';
+    const exp = Number(c.req.query('exp'));
+    if (!bunkerVerifyArtifact(slug, exp, t, DASHBOARD_TOKEN)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const file = bunkerResolveArtifact(sub);
+    if (!file) return c.text('', 404);
+    return new Response(new Uint8Array(file.data), {
+      headers: { 'Content-Type': file.contentType },
+    });
+  });
+
   // We deliberately do NOT return a ws_url here. Older versions of this
   // route sent `ws://localhost:${WARROOM_PORT}`, which broke any
   // Cloudflare-tunneled access since the browser would try to connect to
