@@ -1,7 +1,6 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { logger } from '../logger.js';
-import { getToolGate } from './tool-gate.js';
 import type {
   AgentEngine,
   AgentEngineEvent,
@@ -67,11 +66,9 @@ function pickContextWindow(modelUsage: unknown, model: string | undefined): numb
  *
  * All other tools are allowed unchanged, preserving bypassPermissions behavior.
  */
-function buildCanUseTool(input: AgentTurnInput) {
+function buildAskUserQuestionCanUseTool(input: AgentTurnInput) {
   const resolver = input.onAskUserQuestion;
-  const gate = getToolGate();
-  // Nothing to do if neither a tool gate nor an AskUserQuestion resolver is set.
-  if (!resolver && !gate) return undefined;
+  if (!resolver) return undefined;
   return async (
     toolName: string,
     toolInput: Record<string, unknown>,
@@ -79,21 +76,7 @@ function buildCanUseTool(input: AgentTurnInput) {
     | { behavior: 'allow'; updatedInput: Record<string, unknown> }
     | { behavior: 'deny'; message: string }
   > => {
-    // Layer 1: optional tool gate (e.g. an action-gate policy scorer), applied
-    // to every tool. A deny stops here; an allow falls through to layer 2.
-    if (gate) {
-      try {
-        const g = await gate(toolName, toolInput);
-        if (g.behavior === 'deny') return { behavior: 'deny', message: g.message };
-      } catch (err) {
-        logger.warn(
-          { err: err instanceof Error ? err.message : err },
-          'Tool gate failed; allowing the tool',
-        );
-      }
-    }
-    // Layer 2: AskUserQuestion bridge (only for that tool; needs a resolver).
-    if (toolName !== 'AskUserQuestion' || !resolver) {
+    if (toolName !== 'AskUserQuestion') {
       return { behavior: 'allow', updatedInput: toolInput };
     }
     try {
@@ -169,7 +152,7 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
     // Only wired when the host supplies an AskUserQuestion resolver (the
     // Telegram interactive path). Other paths leave it undefined, so their
     // tool handling is unchanged.
-    const canUseTool = buildCanUseTool(input);
+    const canUseTool = buildAskUserQuestionCanUseTool(input);
 
     try {
       for await (const event of query({

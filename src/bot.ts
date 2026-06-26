@@ -41,26 +41,6 @@ import {
   CLAUDE_MODEL_HAIKU,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
-import { fireHooks } from './hooks.js';
-
-// ── Overlay command-handler registry ────────────────────────────────
-// Lets a layered deployment add bot commands (e.g. /dpp) without editing this
-// file. Register a handler at startup; it is tried in the text handler before a
-// message falls through to the agent. The handler returns true if it consumed
-// the message. Unused (no registration) = pure upstream behaviour.
-export interface BotCommandHandler {
-  /** Command without the leading slash, lowercase (e.g. "dpp"). */
-  name: string;
-  /** Returns true if the command was handled (stops further routing). */
-  handler: (ctx: Context, args: string) => Promise<boolean>;
-}
-
-const overlayCommandHandlers: BotCommandHandler[] = [];
-
-/** Register an overlay bot command handler (called from an overlay bootstrap). */
-export function registerCommandHandler(h: BotCommandHandler): void {
-  overlayCommandHandlers.push(h);
-}
 import { resolvePrimaryAgentId } from './agent-config.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
@@ -1505,14 +1485,6 @@ export function createBot(): Bot {
       })();
     }
 
-    // Fire end-of-session hooks BEFORE clearing, so hooks (e.g. a session
-    // TLDR) can still read the conversation that is about to be wiped.
-    await fireHooks('onSessionEnd', {
-      chatId: chatIdStr,
-      agentId: AGENT_ID,
-      sessionId: oldSessionId ?? undefined,
-    });
-
     clearSession(chatIdStr, AGENT_ID);
     sessionBaseline.delete(chatIdStr);
     await ctx.reply('Session cleared. Starting fresh.');
@@ -2011,21 +1983,6 @@ export function createBot(): Bot {
           await ctx.reply('Failed to send WhatsApp message. Check logs.');
         }
         return;
-      }
-    }
-
-    // Overlay command handlers (e.g. /dpp), registered via registerCommandHandler.
-    // Tried after all security/state checks, before falling through to the agent.
-    if (text.startsWith('/') && overlayCommandHandlers.length > 0) {
-      const [rawCmd, ...rest] = text.split(/[\s@]/);
-      const name = rawCmd.slice(1).toLowerCase();
-      const handler = overlayCommandHandlers.find((h) => h.name === name);
-      if (handler) {
-        const consumed = await handler.handler(ctx, rest.join(' ')).catch((err) => {
-          logger.error({ err, cmd: name }, 'Overlay command handler failed');
-          return true;
-        });
-        if (consumed) return;
       }
     }
 
