@@ -369,6 +369,11 @@ function getAcpEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv 
   return base as NodeJS.ProcessEnv;
 }
 
+// Secret-name guard for the ACP subprocess env. ACP providers run as separate
+// processes, so we strip our own secrets before they inherit the env. This is
+// intentionally separate from security.ts SDK_DROP_VARS_SECRETS, which scrubs the
+// in-process Claude SDK env — different consumer, different lifecycle. Keep both
+// in sync when adding a new secret pattern. (#72)
 function isSecretEnvName(key: string): boolean {
   return [
     'DASHBOARD_TOKEN',
@@ -619,6 +624,8 @@ export class AcpEngineAdapter implements AgentEngine {
       const setSessionModel = async (sessionIdForModel: string): Promise<AgentEngineEvent | null> => {
         if (!input.model) return null;
         try {
+          // `unstable_setSessionModel` is an UNSTABLE ACP method. Verified against
+          // @agentclientprotocol/sdk 0.21.0 — recheck on SDK bumps. (#72 Finding 11)
           await withSpawnError(connection.unstable_setSessionModel({
             sessionId: sessionIdForModel,
             modelId: input.model,

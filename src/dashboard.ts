@@ -132,7 +132,7 @@ import {
 } from './db.js';
 import { messageQueue } from './message-queue.js';
 import * as killSwitches from './kill-switches.js';
-import { getIngestionQuotaStatus, extractViaClaude } from './memory-ingest.js';
+import { getIngestionQuotaStatus, extractViaProvider } from './memory-ingest.js';
 import { WARROOM_ENABLED, WARROOM_PORT, CLAUDE_MODEL_OPUS, CLAUDE_MODEL_SONNET, CLAUDE_MODEL_HAIKU, DEFAULT_OPENROUTER_MODEL } from './config.js';
 import { logger } from './logger.js';
 import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent } from './state.js';
@@ -374,7 +374,7 @@ Reply with JSON: {"agent": "agent_id"}`;
   // Primary path: selected provider via the agent engine. Gemini fallback
   // can hit 429 and surface a 500, blocking the auto-assign UI.
   try {
-    const raw = await extractViaClaude(classificationPrompt);
+    const raw = await extractViaProvider(classificationPrompt);
     const parsed = parseJsonResponse<{ agent: string }>(raw);
     if (parsed?.agent && validAgents.includes(parsed.agent)) return parsed.agent;
   } catch (err) {
@@ -2961,7 +2961,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       // ingest, scheduler). Cold-starts under load have measured up to
       // 90s in practice, vs 4–5s for a standalone CLI call with the
       // same prompt size. Better to wait than fail spuriously.
-      raw = await extractViaClaude(promptStr, 120_000);
+      raw = await extractViaProvider(promptStr, 120_000);
       logger.info({ elapsedMs: Date.now() - t0, responseBytes: raw.length }, 'agent suggestion: selected provider replied');
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err, elapsedMs: Date.now() - t0 }, 'agent suggestion analysis failed');
