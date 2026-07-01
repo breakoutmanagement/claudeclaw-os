@@ -5,6 +5,12 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org) (`git cliff --tag vX.Y.Z`). See CONTRIBUTING.md.
 
+## [1.3.2] - 2026-07-01
+
+### Bug Fixes
+
+- Bump default model to gemini-2.5-flash ([#125](https://github.com/earlyaidopters/claudeclaw-os/pull/125))
+
 ## [1.3.1] - 2026-07-01
 
 ### Features
