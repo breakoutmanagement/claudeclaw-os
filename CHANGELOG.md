@@ -5,6 +5,16 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org) (`git cliff --tag vX.Y.Z`). See CONTRIBUTING.md.
 
+## [1.3.1] - 2026-07-01
+
+### Features
+
+- Upgrade claude-agent-sdk ^0.3.159 -> ^0.3.197
+
+### Testing
+
+- Restore WARROOM_TMP_DIR in config mock
+
 ## [1.3.0] - 2026-07-01
 
 ### Bug Fixes
