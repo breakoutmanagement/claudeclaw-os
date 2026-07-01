@@ -15,15 +15,9 @@ config/API — it usually doesn't.
 Squash-merge each PR with a single conventional-commit title so one PR becomes one clean
 changelog line that links back to the PR number.
 
-**The CHANGELOG is generated, not hand-written.** At release:
-
-```bash
-git cliff --tag vX.Y.Z -o CHANGELOG.md   # regenerate from commit history (see cliff.toml)
-git tag vX.Y.Z                            # tag the release commit
-```
-
-Bump `package.json` in the same release PR. Don't hand-edit `## [unreleased]` blocks —
-let git-cliff produce the section from commits.
+**The CHANGELOG is generated from that commit history — never hand-edit it.** Cutting a
+release (version bump, changelog generation, tagging) is a maintainer-only step;
+contributors just need a clean conventional-commit PR title.
 
 ## Adding a migration
 

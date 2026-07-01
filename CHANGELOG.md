@@ -3,7 +3,7 @@
 All notable changes to ClaudeClaw will be documented here.
 
 From v1.2.0 onward this file is generated from Conventional Commit history with
-[git-cliff](https://git-cliff.org) (`git cliff --tag vX.Y.Z`). See CONTRIBUTING.md.
+[git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
 ## [1.3.2] - 2026-07-01
 
