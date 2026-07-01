@@ -9,12 +9,34 @@ import { logger } from '../logger.js';
 import { VERSION } from '../version.js';
 import type { ProviderConfig } from '../provider.js';
 import { getScrubbedSdkEnv } from '../security.js';
-import type { AgentEngine, AgentEngineEvent, AgentEngineProgressEvent, AgentTurnInput, McpStdioConfig } from './types.js';
+import type { AgentEngine, AgentEngineEvent, AgentEngineProgressEvent, AgentEngineUsage, AgentTurnInput, McpStdioConfig } from './types.js';
 import { emptyUsage } from './types.js';
+
+/**
+ * Build engine usage from an ACP `usage_update` notification (#70).
+ *
+ * Only the point-in-time context fields are mapped: `size` (context window) and
+ * `used` (tokens currently in context). These are snapshots, so they can't
+ * overcount. We deliberately do NOT map per-turn inputTokens/outputTokens or
+ * totalCostUsd here: ACP's PromptResponse.usage and UsageUpdate.cost are
+ * CUMULATIVE session totals, and downstream sums usage per turn (todayCost,
+ * budget warnings), so feeding cumulative values would overcount. Per-turn cost
+ * needs delta-tracking of the cumulative value and live provider verification —
+ * tracked as the remaining half of #70.
+ */
+export function acpUsageFromUpdate(u: acp.UsageUpdate | undefined): AgentEngineUsage {
+  if (!u) return emptyUsage();
+  return {
+    ...emptyUsage(),
+    contextWindow: typeof u.size === 'number' ? u.size : null,
+    lastCallInputTokens: typeof u.used === 'number' ? u.used : 0,
+  };
+}
 
 class ClaudeClawAcpClient {
   private accumulatedText = '';
   private toolTitles = new Map<string, string>();
+  private lastUsageUpdate: acp.UsageUpdate | undefined;
 
   constructor(
     private readonly emit: (event: AgentEngineEvent) => void,
@@ -23,6 +45,13 @@ class ClaudeClawAcpClient {
 
   get text(): string {
     return this.accumulatedText;
+  }
+
+  /** Latest point-in-time usage snapshot from the provider's usage_update
+   *  notifications (context window size + current fill). Undefined if the
+   *  provider never emits usage_update. */
+  get usageUpdate(): acp.UsageUpdate | undefined {
+    return this.lastUsageUpdate;
   }
 
   async sessionUpdate(params: acp.SessionNotification): Promise<void> {
@@ -80,6 +109,14 @@ class ClaudeClawAcpClient {
             planEntries,
           }, params);
         }
+        break;
+      }
+      case 'usage_update': {
+        // Point-in-time context snapshot (size = window, used = current fill).
+        // Captured for the result's contextWindow / last-call telemetry. Cost
+        // and per-turn token counts are intentionally not mapped — ACP reports
+        // cumulative session totals (see acpUsageFromUpdate / #70).
+        this.lastUsageUpdate = update as unknown as acp.UsageUpdate;
         break;
       }
     }
@@ -743,15 +780,15 @@ export class AcpEngineAdapter implements AgentEngine {
       for await (const event of flush()) yield event;
 
       if (promptResult.stopReason === 'cancelled' || input.abortController?.signal.aborted) {
-        yield { type: 'aborted', text: client.text || null, sessionId: activeSessionId, usage: emptyUsage() };
+        yield { type: 'aborted', text: client.text || null, sessionId: activeSessionId, usage: acpUsageFromUpdate(client.usageUpdate) };
         return;
       }
 
-      yield { type: 'result', text: client.text || null, usage: emptyUsage(), raw: promptResult };
+      yield { type: 'result', text: client.text || null, usage: acpUsageFromUpdate(client.usageUpdate), raw: promptResult };
     } catch (err) {
       for await (const event of flush()) yield event;
       if (input.abortController?.signal.aborted) {
-        yield { type: 'aborted', text: client.text || null, sessionId: input.sessionId, usage: emptyUsage() };
+        yield { type: 'aborted', text: client.text || null, sessionId: input.sessionId, usage: acpUsageFromUpdate(client.usageUpdate) };
         return;
       }
 
