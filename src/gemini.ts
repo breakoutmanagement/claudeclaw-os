@@ -17,13 +17,11 @@ function getClient(): GoogleGenAI {
 
 /**
  * Generate text content via Gemini.
- * Defaults to gemini-2.0-flash. The 2.5 migration is tracked separately
- * — 2.0-flash retires June 2026 and new GCP projects already see 404s,
- * so the default bump belongs in its own PR with a changelog note.
+ * Bumped to gemini-2.5-flash (2.0-flash 404s on newer GCP projects).
  */
 export async function generateContent(
   prompt: string,
-  model = 'gemini-2.0-flash',
+  model = 'gemini-2.5-flash',
 ): Promise<string> {
   // Kill-switch: refuse Gemini calls when LLM_SPAWN_ENABLED is off.
   // Memory ingestion, classifier paths, and any other generateContent
