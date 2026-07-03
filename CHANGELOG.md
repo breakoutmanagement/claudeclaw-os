@@ -5,6 +5,22 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.4.0] - 2026-07-03
+
+### Bug Fixes
+
+- Five Linux/systemd/VPS setup bugs (dashboard bind, warroom key, root sandbox, kill loop) ([#129](https://github.com/earlyaidopters/claudeclaw-os/pull/129))
+- Accept custom Claude model ids, show persisted model, extend /model ([#127](https://github.com/earlyaidopters/claudeclaw-os/pull/127))
+- Root storage at CLAUDECLAW_CONFIG, not a hardcoded ~/.claudeclaw ([#126](https://github.com/earlyaidopters/claudeclaw-os/pull/126))
+
+### Documentation
+
+- Focus CONTRIBUTING on PR-title convention, drop destructive git-cliff -o
+
+### Features
+
+- One-command VPS installer with Tailscale-private dashboard ([#128](https://github.com/earlyaidopters/claudeclaw-os/pull/128))
+
 ## [1.3.2] - 2026-07-01
 
 ### Bug Fixes
