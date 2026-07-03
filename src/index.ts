@@ -1,3 +1,7 @@
+// Imported first so the process-level uncaughtException guard is installed
+// before anything transitively pulls in @anthropic-ai/claude-agent-sdk.
+import './crash-guard.js';
+
 import fs from 'fs';
 import path from 'path';
 

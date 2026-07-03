@@ -1,13 +1,47 @@
+import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { logger } from '../logger.js';
 import { authError, isAuthErrorText } from '../errors.js';
+
 import type {
   AgentEngine,
   AgentEngineEvent,
   AgentTurnInput,
   AskUserQuestionRequest,
 } from './types.js';
+
+// Pick the `claude` binary to run only when we must override the SDK default.
+// The SDK's bundled Linux binary can't exec on NixOS (no ld-linux), which
+// crashes the process — so on Nix we point it at the system `claude`. Returns
+// undefined everywhere else, leaving the SDK's own resolution untouched.
+function resolveClaudeExecutableOverride(): string | undefined {
+  const override = process.env.CLAUDECLAW_CLAUDE_EXECUTABLE_PATH?.trim();
+  if (override) {
+    logger.info({ path: override }, 'Using CLAUDECLAW_CLAUDE_EXECUTABLE_PATH override for claude CLI');
+    return override;
+  }
+  if (process.platform === 'linux' && existsSync('/etc/NIXOS')) {
+    try {
+      const found = execSync('command -v claude', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      if (found) {
+        logger.info({ path: found }, 'NixOS detected — using the system claude CLI (bundled binary cannot run on Nix)');
+        return found;
+      }
+    } catch {
+      // no system claude on PATH; fall through to the warning
+    }
+    logger.warn('NixOS detected but no `claude` on PATH. Install claude-code or set CLAUDECLAW_CLAUDE_EXECUTABLE_PATH.');
+  }
+  return undefined;
+}
+
+const CLAUDE_EXECUTABLE_OVERRIDE = resolveClaudeExecutableOverride();
 
 const TOOL_LABELS: Record<string, string> = {
   Read: 'Reading file',
@@ -181,6 +215,7 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
           ...(input.allowedTools ? { allowedTools: input.allowedTools } : {}),
           ...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
           ...(input.abortController ? { abortController: input.abortController } : {}),
+          ...(CLAUDE_EXECUTABLE_OVERRIDE ? { pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE_OVERRIDE } : {}),
           stderr: (data: string) => logger.error({ stderr: data }, 'claude subprocess stderr'),
           // TODO(#72): the SDK Options type (@anthropic-ai/claude-agent-sdk) lags
           // some fields we pass conditionally (effort, thinking, model overrides),
