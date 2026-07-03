@@ -4,7 +4,7 @@ import { spawnSync } from 'child_process';
 import { createRequire } from 'module';
 import yaml from 'js-yaml';
 
-import { STORE_DIR, DEFAULT_CLAUDE_MODEL } from './config.js';
+import { STORE_DIR, DEFAULT_CLAUDE_MODEL, CLAUDECLAW_CONFIG, PROJECT_ROOT } from './config.js';
 import { readEnvFile } from './env.js';
 
 export type ProviderType = 'claude' | 'acp' | 'opencode' | 'gemini' | 'codex' | 'openrouter';
@@ -106,16 +106,83 @@ function writeMainConfig(raw: Record<string, unknown>): void {
   fs.writeFileSync(mainConfigPath(), JSON.stringify(raw, null, 2) + '\n', 'utf-8');
 }
 
+// ── Main provider persistence ─────────────────────────────────────────
+// Main persists its provider/model in agents/main/agent.yaml — the SAME
+// provider block sub-agents use (setAgentProvider) — so there is one
+// persistence story for every agent. Historically main persisted to
+// store/main-config.json instead, and the `model:` field in main's
+// agent.yaml was dead config that index.ts never read. Reads migrate the
+// legacy main-config.json provider into agent.yaml once (creating the
+// file if it doesn't exist), then agent.yaml is the single source.
+
+function mainAgentYamlPath(): string {
+  const externalPath = path.join(CLAUDECLAW_CONFIG, 'agents', 'main', 'agent.yaml');
+  if (fs.existsSync(externalPath)) return externalPath;
+  return path.join(PROJECT_ROOT, 'agents', 'main', 'agent.yaml');
+}
+
+function readMainAgentYaml(): Record<string, unknown> | undefined {
+  try {
+    const p = mainAgentYamlPath();
+    if (!fs.existsSync(p)) return undefined;
+    return (yaml.load(fs.readFileSync(p, 'utf-8')) as Record<string, unknown>) ?? {};
+  } catch {
+    return undefined;
+  }
+}
+
+function writeMainAgentYaml(raw: Record<string, unknown>): void {
+  // Prefer the external config dir for a fresh file; that's where agent
+  // yamls live on a configured install.
+  const p = mainAgentYamlPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, yaml.dump(raw, { lineWidth: -1 }), 'utf-8');
+}
+
 export function getMainProviderConfig(): ProviderConfig {
-  const raw = readMainConfig();
-  return normalizeProviderConfig(raw.provider, typeof raw.model === 'string' ? raw.model : undefined);
+  const agentYaml = readMainAgentYaml();
+
+  // agent.yaml provider block wins — it's the unified persistence.
+  if (agentYaml && agentYaml.provider !== undefined) {
+    return normalizeProviderConfig(agentYaml.provider);
+  }
+
+  // Legacy main-config.json provider: migrate it into agent.yaml once so
+  // future reads and writes converge on one file. Reads before the first
+  // dashboard write also converge here.
+  const legacy = readMainConfig();
+  if (legacy.provider !== undefined || typeof legacy.model === 'string') {
+    const provider = normalizeProviderConfig(legacy.provider, typeof legacy.model === 'string' ? legacy.model : undefined);
+    try {
+      setMainProviderConfig(provider);
+    } catch { /* read-only fs: keep serving the legacy value */ }
+    return provider;
+  }
+
+  // Legacy dead `model:` field in agent.yaml (never read by index.ts for
+  // main historically) — honor it now that agent.yaml is authoritative.
+  if (agentYaml && typeof agentYaml.model === 'string' && agentYaml.model.startsWith('claude-')) {
+    return { type: 'claude', model: agentYaml.model };
+  }
+
+  return { ...DEFAULT_PROVIDER };
 }
 
 export function setMainProviderConfig(provider: ProviderConfig): void {
-  const raw = readMainConfig();
-  raw.provider = providerToYaml(provider);
-  delete raw.model;
-  writeMainConfig(raw);
+  const raw = readMainAgentYaml() ?? { name: 'Main' };
+  if (typeof raw.name !== 'string' || !raw.name) raw.name = 'Main';
+  writeProviderToYaml(raw, provider); // sets provider block, removes legacy model:
+  writeMainAgentYaml(raw);
+
+  // Clean the superseded provider/model keys out of main-config.json so
+  // there's no second, stale copy to confuse anyone. Other keys
+  // (description etc.) stay.
+  const legacy = readMainConfig();
+  if (legacy.provider !== undefined || legacy.model !== undefined) {
+    delete legacy.provider;
+    delete legacy.model;
+    writeMainConfig(legacy);
+  }
 }
 
 export function getProviderDisplay(provider: ProviderConfig): string {

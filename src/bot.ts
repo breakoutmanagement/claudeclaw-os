@@ -21,6 +21,7 @@ import {
   activeBotToken,
   agentDefaultModel,
   agentProvider,
+  updateAgentProvider,
   agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
@@ -41,7 +42,7 @@ import {
   CLAUDE_MODEL_HAIKU,
 } from './config.js';
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
-import { resolvePrimaryAgentId } from './agent-config.js';
+import { resolvePrimaryAgentId, setAgentProvider } from './agent-config.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -49,7 +50,7 @@ import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
 import { trackUsage, getRateStatus } from './rate-tracker.js';
 import { buildCostFooter } from './cost-footer.js';
-import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig } from './provider.js';
+import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig, setMainProviderConfig } from './provider.js';
 import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
@@ -187,7 +188,6 @@ const AVAILABLE_MODELS: Record<string, string> = {
   sonnet: CLAUDE_MODEL_SONNET,
   haiku: CLAUDE_MODEL_HAIKU,
 };
-const DEFAULT_MODEL_LABEL = 'opus';
 
 export function setMainModelOverride(model: string): void {
   if (ALLOWED_CHAT_ID) chatModelOverride.set(ALLOWED_CHAT_ID, model);
@@ -1542,10 +1542,17 @@ export function createBot(): Bot {
     }
   });
 
-  // /model — switch Claude model (opus, sonnet, haiku)
+  // /model — switch Claude model (opus, sonnet, haiku shortcuts, or any
+  // full claude-* id, e.g. /model claude-sonnet-4-5). Changes PERSIST to
+  // agent.yaml — the same provider block the dashboard writes — and take
+  // effect immediately in-process. Telegram, dashboard, and agent.yaml
+  // are one synced store; there is no temporary per-chat override.
   bot.command('model', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
+    // Clear any pre-persistence chat override so the persisted value is
+    // what actually runs (the override map outranks it in the query path).
+    chatModelOverride.delete(chatIdStr);
     const provider = activeProvider();
     if (provider.type !== 'claude') {
       await ctx.reply(`Active provider: ${getProviderDisplay(provider)}\n/model only applies to Claude. Use npm run provider:setup or the dashboard to change provider/model settings.`);
@@ -1553,30 +1560,52 @@ export function createBot(): Bot {
     }
     const arg = ctx.match?.trim().toLowerCase();
 
+    const persist = (next: ProviderConfig): void => {
+      if (AGENT_ID === 'main') setMainProviderConfig(next);
+      else setAgentProvider(AGENT_ID, next);
+      updateAgentProvider(next); // in-memory, effective this turn
+    };
+
     if (!arg) {
-      const current = chatModelOverride.get(chatIdStr);
-      const currentLabel = current
-        ? Object.entries(AVAILABLE_MODELS).find(([, v]) => v === current)?.[0] ?? current
-        : DEFAULT_MODEL_LABEL + ' (default)';
+      const effective = agentDefaultModel ?? provider.model ?? DEFAULT_CLAUDE_MODEL;
+      const label = Object.entries(AVAILABLE_MODELS).find(([, v]) => v === effective)?.[0] ?? effective;
+      const source = agentDefaultModel || provider.model ? 'agent.yaml' : 'default';
       const models = Object.keys(AVAILABLE_MODELS).join(', ');
-      await ctx.reply(`Current model: ${currentLabel}\nAvailable: ${models}\n\nUsage: /model haiku`);
+      await ctx.reply(`Current model: ${label} (${source})\nShortcuts: ${models}\nOr a full id: /model claude-sonnet-4-5\n\nChanges persist (agent.yaml), same as the dashboard picker.`);
       return;
     }
 
-    if (arg === 'reset' || arg === 'default' || arg === 'opus') {
-      chatModelOverride.delete(chatIdStr);
-      await ctx.reply('Model reset to default (opus)');
+    if (arg === 'reset' || arg === 'default') {
+      // Drop the persisted model so the provider default applies.
+      const next: ProviderConfig = { ...provider };
+      delete next.model;
+      try {
+        persist(next);
+      } catch (err) {
+        await ctx.reply(`Failed to persist: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      await ctx.reply(`Model reset to default: ${DEFAULT_CLAUDE_MODEL} (persisted)`);
       return;
     }
 
-    const modelId = AVAILABLE_MODELS[arg];
+    // Shortcut label, or any full claude-* model id. Same format gate as
+    // the dashboard set-model endpoints — the SDK 404s clearly on first
+    // use if the id doesn't exist, which is the real validator.
+    const modelId = AVAILABLE_MODELS[arg]
+      ?? (/^claude-[a-z0-9][a-z0-9.-]*$/.test(arg) ? arg : undefined);
     if (!modelId) {
-      await ctx.reply(`Unknown model: ${arg}\nAvailable: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
+      await ctx.reply(`Unknown model: ${arg}\nShortcuts: ${Object.keys(AVAILABLE_MODELS).join(', ')}\nOr a full id, e.g. /model claude-sonnet-4-5`);
       return;
     }
 
-    chatModelOverride.set(chatIdStr, modelId);
-    await ctx.reply(`Model changed: ${arg} (${modelId})`);
+    try {
+      persist({ ...provider, model: modelId });
+    } catch (err) {
+      await ctx.reply(`Failed to persist: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    await ctx.reply(`Model changed: ${arg === modelId ? modelId : `${arg} (${modelId})`}\nPersisted to agent.yaml — applies everywhere until changed again.`);
   });
 
   // /provider — display active provider/model source only.

@@ -92,6 +92,10 @@ export function updateAgentSystemPrompt(next: string | undefined): void {
  * honest without rebuilding the full agent override object. */
 export function updateAgentProvider(next: ProviderConfig | undefined): void {
   agentProvider = next;
+  // A provider block supersedes any legacy top-level `model:` loaded at
+  // boot — persisting removes it from agent.yaml, so drop the stale
+  // in-memory copy too (it outranks provider.model in the query path).
+  agentDefaultModel = undefined;
 }
 
 export const TELEGRAM_BOT_TOKEN =
