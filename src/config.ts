@@ -15,6 +15,7 @@ const envConfig = readEnvFile([
   'SLACK_USER_TOKEN',
   'CONTEXT_LIMIT',
   'DASHBOARD_PORT',
+  'DASHBOARD_BIND',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
   'CLAUDECLAW_CONFIG',
@@ -205,6 +206,8 @@ export const DASHBOARD_PORT = parseInt(
   process.env.DASHBOARD_PORT || envConfig.DASHBOARD_PORT || '3141',
   10,
 );
+export const DASHBOARD_BIND =
+  process.env.DASHBOARD_BIND || envConfig.DASHBOARD_BIND || '127.0.0.1';
 export const DASHBOARD_TOKEN =
   process.env.DASHBOARD_TOKEN || envConfig.DASHBOARD_TOKEN || '';
 export const DASHBOARD_URL =

@@ -275,7 +275,7 @@ async function main(): Promise<void> {
           if (shuttingDown) return;
           const proc = spawn(venvPython, [serverScript], {
             cwd: PROJECT_ROOT,
-            env: { ...process.env, WARROOM_PORT: String(WARROOM_PORT) },
+            env: { ...process.env, WARROOM_PORT: String(WARROOM_PORT), GOOGLE_API_KEY },
             stdio: ['ignore', 'pipe', 'pipe'],
             windowsHide: true,
           });

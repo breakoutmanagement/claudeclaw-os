@@ -181,6 +181,7 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
           ...(input.allowedTools ? { allowedTools: input.allowedTools } : {}),
           ...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
           ...(input.abortController ? { abortController: input.abortController } : {}),
+          stderr: (data: string) => logger.error({ stderr: data }, 'claude subprocess stderr'),
           // TODO(#72): the SDK Options type (@anthropic-ai/claude-agent-sdk) lags
           // some fields we pass conditionally (effort, thinking, model overrides),
           // so the whole object is cast. Narrow to the SDK Options type and cast

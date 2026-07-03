@@ -810,6 +810,28 @@ function registerAuqCallbackHandler(bot: Bot): void {
   });
 }
 
+// Set in createBot() so the module-level emergency-kill path can drain the
+// killing update before exit without threading the Bot through every caller.
+let botRef: Bot | undefined;
+
+// Advance Telegram's offset past the kill message so a supervisor restart
+// (systemd Restart=always) does not redeliver it and re-trigger the kill.
+// Stops the long-poller first — a concurrent getUpdates would 409-conflict.
+//
+// Both steps are time-boxed: grammY's bot.stop() waits for in-flight update
+// processing to settle, and this runs *inside* the killing handler, so an
+// unbounded await could deadlock and starve the caller's process.exit
+// watchdog. A hard cap guarantees we always fall through to the kill.
+async function drainKillUpdate(ctx: Context): Promise<void> {
+  const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | void> =>
+    Promise.race([p.catch(() => {}), new Promise<void>((r) => setTimeout(r, ms).unref?.())]);
+  if (botRef) await withTimeout(botRef.stop(), 2000);
+  await withTimeout(
+    ctx.api.getUpdates({ offset: ctx.update.update_id + 1, limit: 1, timeout: 0 }),
+    2000,
+  );
+}
+
 async function handleMessage(ctx: Context, message: string, forceVoiceReply = false, skipLog = false): Promise<void> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
@@ -852,6 +874,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   if (checkKillPhrase(message)) {
     audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill triggered', blocked: false });
     await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+    await drainKillUpdate(ctx);
     executeEmergencyKill();
     return;
   }
@@ -1321,6 +1344,7 @@ export function createBot(): Bot {
   }
 
   const bot = new Bot(token);
+  botRef = bot; // expose for the module-level emergency-kill drain
 
   // Reject group chats. ClaudeClaw only works in private (1-on-1) chats.
   // This prevents message leakage if the bot is added to a group.
@@ -1857,6 +1881,7 @@ export function createBot(): Bot {
     if (checkKillPhrase(text)) {
       audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill via text handler', blocked: false });
       await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+      await drainKillUpdate(ctx);
       executeEmergencyKill();
       return;
     }
