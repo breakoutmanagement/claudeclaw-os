@@ -1,9 +1,14 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { Api, Bot, Context, InputFile, RawApi } from 'grammy';
+import { Api, Bot, Context, InlineKeyboard, InputFile, RawApi } from 'grammy';
 
-import { runAgent, runAgentWithRetry, UsageInfo, AgentProgressEvent } from './agent.js';
+import { runAgent, runAgentWithRetry, UsageInfo, AgentProgressEvent, AgentToolPolicy } from './agent.js';
+import type {
+  AskUserQuestionRequest,
+  AskUserQuestionAnswer,
+  AskUserQuestionResolver,
+} from './agent-engine/index.js';
 import { AgentError } from './errors.js';
 import {
   AGENT_ID,
@@ -15,6 +20,8 @@ import {
   MAX_MESSAGE_LENGTH,
   activeBotToken,
   agentDefaultModel,
+  agentProvider,
+  updateAgentProvider,
   agentMcpAllowlist,
   agentSystemPrompt,
   TYPING_REFRESH_MS,
@@ -28,9 +35,14 @@ import {
   PROTECTED_ENV_VARS,
   DAILY_COST_BUDGET,
   HOURLY_TOKEN_BUDGET,
+  MEMORY_NOTIFY,
   PROJECT_ROOT,
+  CLAUDE_MODEL_OPUS,
+  CLAUDE_MODEL_SONNET,
+  CLAUDE_MODEL_HAIKU,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
+import { resolvePrimaryAgentId, setAgentProvider } from './agent-config.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -45,6 +57,8 @@ export function setHookRegistry(registry: HookRegistry): void {
   hookRegistry = registry;
 }
 import { buildCostFooter } from './cost-footer.js';
+import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, ProviderConfig, setMainProviderConfig } from './provider.js';
+import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
@@ -61,6 +75,21 @@ import {
   audit,
 } from './security.js';
 
+// ── ACP tool policy for conversational chat turns ────────────────────
+// Telegram and dashboard chat are conversational by default. Claude has
+// months of demonstrated good judgment about when to run tools mid-chat,
+// so it keeps full access. ACP providers (codex/gemini/opencode) are new
+// to this path and have shown they'll happily interpret a casual message
+// as a coding task — codex once ran the full test suite on "hey, wake up,
+// time to solve the puzzle." Lock them to read-only by default; lift via
+// explicit per-turn escalation in a follow-up.
+const CHAT_ACP_TOOL_POLICY: AgentToolPolicy = { allowedTools: ['Read', 'Grep', 'Glob'] };
+
+function chatToolPolicyFor(provider: ProviderConfig | undefined): AgentToolPolicy | undefined {
+  if (!provider || provider.type === 'claude') return undefined;
+  return CHAT_ACP_TOOL_POLICY;
+}
+
 // ── Streaming rate limiter ───────────────────────────────────────────
 const globalStreamLastEdit = new Map<string, number>();
 const GLOBAL_STREAM_INTERVAL_MS = 2500;
@@ -68,7 +97,9 @@ const GLOBAL_STREAM_INTERVAL_MS = 2500;
 // ── Context window tracking ──────────────────────────────────────────
 // Uses input_tokens from the last API call (= actual context window size:
 // system prompt + conversation history + tool results for that call).
-// Compares against CONTEXT_LIMIT (default 1M for Opus 4.6 1M, configurable).
+// Compares against the active model's real context window reported by the SDK
+// (e.g. Opus 4.8 = 1M, Sonnet 4.6 = 200k), falling back to CONTEXT_LIMIT when
+// the engine doesn't report one (e.g. ACP providers).
 //
 // On a fresh session the base overhead (system prompt, skills, CLAUDE.md,
 // MCP tools) can be 200-400k+ tokens. We track that baseline per session
@@ -100,7 +131,8 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
   }
 
   const baseline = sessionBaseline.get(baseKey)!;
-  const available = CONTEXT_LIMIT - baseline;
+  const contextLimit = usage.contextWindow ?? CONTEXT_LIMIT;
+  const available = contextLimit - baseline;
   if (available <= 0) return null;
 
   const conversationTokens = contextTokens - baseline;
@@ -111,6 +143,32 @@ function checkContextWarning(chatId: string, sessionId: string | undefined, usag
   }
 
   return null;
+}
+
+function activeProvider(): ProviderConfig {
+  return agentProvider ?? getMainProviderConfig();
+}
+
+export function modelStatusLine(provider: ProviderConfig, chatId: string): string {
+  if (provider.type === 'claude') {
+    return `Model: ${chatModelOverride.get(chatId) ?? agentDefaultModel ?? provider.model ?? DEFAULT_CLAUDE_MODEL}`;
+  }
+  if (provider.model) return `Model: ${provider.model}`;
+  if (provider.type === 'codex') return 'Model: Codex default';
+  if (provider.type === 'gemini') return 'Model: Gemini CLI default';
+  if (provider.type === 'opencode') return 'Model: OpenCode default';
+  return 'Model: Provider default';
+}
+
+function canUseTelegramUrlButton(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    return host !== 'localhost' && host !== '127.0.0.1' && host !== '::1';
+  } catch {
+    return false;
+  }
 }
 import {
   downloadTelegramFile,
@@ -129,12 +187,14 @@ const voiceEnabledChats = new Set<string>();
 // When not set, uses CLI default (Opus via Max/OAuth)
 const chatModelOverride = new Map<string, string>();
 
+// Label → model ID for the /model opus|sonnet|haiku shortcuts. IDs resolve
+// from env/config (see config.ts) so they track new model releases without a
+// code change — set CLAUDE_MODEL_OPUS etc. in .env and restart.
 const AVAILABLE_MODELS: Record<string, string> = {
-  opus: 'claude-opus-4-6',
-  sonnet: 'claude-sonnet-4-5',
-  haiku: 'claude-haiku-4-5',
+  opus: CLAUDE_MODEL_OPUS,
+  sonnet: CLAUDE_MODEL_SONNET,
+  haiku: CLAUDE_MODEL_HAIKU,
 };
-const DEFAULT_MODEL_LABEL = 'opus';
 
 export function setMainModelOverride(model: string): void {
   if (ALLOWED_CHAT_ID) chatModelOverride.set(ALLOWED_CHAT_ID, model);
@@ -465,6 +525,406 @@ async function replyIfLocked(ctx: Context): Promise<boolean> {
  * @param forceVoiceReply  When true, always respond with audio (e.g. user sent a voice note).
  * @param skipLog  When true, skip logging this turn to conversation_log (used by /respin to avoid self-referential logging).
  */
+// ── AskUserQuestion → Telegram inline keyboard ──────────────────────
+// Bridges the built-in AskUserQuestion tool to tap-to-choose buttons. The SDK
+// adapter intercepts the tool call (see claude-sdk-adapter.ts) and invokes the
+// resolver built here; we render a keyboard, await the user's taps via the
+// callback_query handler, and hand the chosen labels back to the model.
+
+interface PendingQuestion {
+  chatId: string;
+  request: AskUserQuestionRequest;
+  // Selected option labels per question index (multi-select keeps several).
+  selections: string[][];
+  // Index of the question currently shown in the stepper.
+  current: number;
+  messageId?: number;
+  resolve: (answer: AskUserQuestionAnswer | null) => void;
+  timeout: ReturnType<typeof setTimeout>;
+  // True while the current question is awaiting a free-text "Other" reply.
+  awaitingOther: boolean;
+  // The turn's abort controller — lets the Stop button truly exit the turn.
+  abortController?: AbortController;
+  // Flips the turn-level "stop asking questions" flag (set by Proceed).
+  markStopAsking?: () => void;
+  settled: boolean;
+}
+
+// Keyed by a short token that rides in callback_data (well under Telegram's
+// 64-byte limit). The token maps to the full server-side state.
+const pendingQuestions = new Map<string, PendingQuestion>();
+// One in-flight question per chat — lets the message handler route a free-text
+// "Other" reply to the right pending question.
+const pendingByChat = new Map<string, string>();
+
+const AUQ_TIMEOUT_MS = 10 * 60 * 1000; // 10 min to tap before giving up
+const OTHER_LABEL = '✏️ Other';
+
+// Returned to the model when the user taps Proceed: end the clarifying-question
+// flow and continue. Also auto-returned for any further AskUserQuestion the
+// model tries in the same turn, so the user isn't bombarded with more popups.
+const PROCEED_DIRECTIVE =
+  'The user has ended the clarifying-question flow and wants you to proceed. ' +
+  'Use any answers gathered so far plus your best judgment. Do NOT open further ' +
+  'AskUserQuestion prompts for the rest of this turn. If meaningful ambiguity ' +
+  'remains, continue with reasonable assumptions, then at the end briefly ' +
+  'summarize what you did and ask in plain text whether they want to change ' +
+  'anything or take a different direction.';
+
+function makeToken(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+/** Text for the current step: "(2/3) <question>" when there are several. */
+function buildStepText(q: PendingQuestion): string {
+  const n = q.request.questions.length;
+  const cur = q.request.questions[q.current];
+  const prefix = n > 1 ? `(${q.current + 1}/${n}) ` : '';
+  return `${prefix}${cur.question}`;
+}
+
+/**
+ * Keyboard for the current step. One question at a time. Single-select steps
+ * auto-advance on tap (no Next). Multi-select steps toggle and need Next/Done
+ * to commit. Skip drops just this question; Stop aborts the whole turn.
+ */
+function buildStepKeyboard(token: string, q: PendingQuestion): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  const cur = q.request.questions[q.current];
+  const selected = q.selections[q.current] ?? [];
+  const multiQuestion = q.request.questions.length > 1;
+
+  cur.options.forEach((opt, oIdx) => {
+    const mark = selected.includes(opt.label) ? '✓ ' : '';
+    kb.text(`${mark}${opt.label}`, `auq:${token}:opt:${oIdx}`).row();
+  });
+  kb.text(OTHER_LABEL, `auq:${token}:other`).row();
+
+  // Control row, all on one line. Tapping an option only marks it. For
+  // multi-question prompts, Next cycles through the questions (wrapping from
+  // the last back to the first) so any answer can be revisited without a Prev
+  // button — and leaving a question unselected on the way past is how you skip
+  // it. Done finalises with whatever has been answered (unanswered questions
+  // are reported as skipped; Done with nothing selected = skip everything).
+  // Stop aborts the whole turn.
+  if (multiQuestion) kb.text('▶ Next', `auq:${token}:next`);
+  kb
+    .text('✅ Done', `auq:${token}:done`)
+    .text('🏁 Go', `auq:${token}:proceed`)
+    .text('✖ Stop', `auq:${token}:stop`);
+  return kb;
+}
+
+function buildAnswer(q: PendingQuestion): AskUserQuestionAnswer {
+  return {
+    answers: q.request.questions.map((question, qIdx) => ({
+      header: question.header,
+      question: question.question,
+      selected: q.selections[qIdx] ?? [],
+    })),
+  };
+}
+
+/**
+ * Final summary the keyboard message becomes once all steps are done. Shows
+ * the full question text alongside the answer so the detail isn't lost when
+ * the stepper collapses to a summary.
+ */
+function buildAnsweredText(q: PendingQuestion): string {
+  const blocks = q.request.questions.map((question, i) => {
+    const sel = q.selections[i] ?? [];
+    const label = question.header || `Q${i + 1}`;
+    const answer = sel.length ? sel.join(', ') : '(skipped)';
+    return `${question.question}\n✓ ${label}: ${answer}`;
+  });
+  return blocks.join('\n\n');
+}
+
+/** Cycle to the next question, wrapping last → first (no Prev needed). */
+async function advanceStep(api: Api, token: string): Promise<void> {
+  const q = pendingQuestions.get(token);
+  if (!q || q.settled) return;
+  q.awaitingOther = false;
+  q.current = (q.current + 1) % q.request.questions.length;
+  if (q.messageId) {
+    await api
+      .editMessageText(q.chatId, q.messageId, buildStepText(q), {
+        reply_markup: buildStepKeyboard(token, q),
+      })
+      .catch(() => {});
+  }
+}
+
+/** Finalise: edit the message to the answer summary and settle the promise. */
+async function finalizeQuestion(api: Api, token: string): Promise<void> {
+  const q = pendingQuestions.get(token);
+  if (!q || q.settled) return;
+  if (q.messageId) {
+    await api.editMessageText(q.chatId, q.messageId, buildAnsweredText(q)).catch(() => {});
+  }
+  settlePending(token, buildAnswer(q));
+}
+
+/**
+ * Proceed: submit any answers so far AND tell the model to stop asking
+ * questions for the rest of the turn. Sets the turn-level stop flag so further
+ * AskUserQuestion calls are auto-dismissed with the same directive.
+ */
+async function finalizeWithProceed(api: Api, token: string): Promise<void> {
+  const q = pendingQuestions.get(token);
+  if (!q || q.settled) return;
+  q.markStopAsking?.();
+  if (q.messageId) {
+    await api
+      .editMessageText(q.chatId, q.messageId, `${buildAnsweredText(q)}\n\n🏁 Proceeding. Questions ended, no more this turn.`)
+      .catch(() => {});
+  }
+  const answer = buildAnswer(q);
+  answer.directive = PROCEED_DIRECTIVE;
+  settlePending(token, answer);
+}
+
+function cleanupPending(token: string): void {
+  const q = pendingQuestions.get(token);
+  if (!q) return;
+  clearTimeout(q.timeout);
+  pendingQuestions.delete(token);
+  if (pendingByChat.get(q.chatId) === token) pendingByChat.delete(q.chatId);
+}
+
+function settlePending(token: string, answer: AskUserQuestionAnswer | null): void {
+  const q = pendingQuestions.get(token);
+  if (!q || q.settled) return;
+  q.settled = true;
+  cleanupPending(token);
+  q.resolve(answer);
+}
+
+/**
+ * Build the resolver handed to the agent for one chat. Renders the first step,
+ * registers pending state, and returns a promise that settles when the user
+ * finishes (or skips/stops/times out). One pending question per chat — a new
+ * one supersedes any prior unanswered question in that chat.
+ */
+function makeAskUserQuestionResolver(
+  ctx: Context,
+  chatId: number,
+  abortController?: AbortController,
+): AskUserQuestionResolver {
+  // Turn-level flag: once the user taps Proceed, every later AskUserQuestion in
+  // this same turn is auto-answered with the proceed directive (no keyboard).
+  let stopAsking = false;
+  return (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer | null> => {
+    const chatIdStr = chatId.toString();
+    // Supersede any stale pending question in this chat.
+    const prior = pendingByChat.get(chatIdStr);
+    if (prior) settlePending(prior, null);
+
+    // Already aborted before we even render — bail immediately.
+    if (abortController?.signal.aborted) return Promise.resolve(null);
+
+    // User already chose Proceed earlier this turn — don't prompt again.
+    if (stopAsking) {
+      return Promise.resolve({ answers: [], directive: PROCEED_DIRECTIVE });
+    }
+
+    const token = makeToken();
+    return new Promise<AskUserQuestionAnswer | null>((resolve) => {
+      const timeout = setTimeout(() => {
+        void ctx.api.sendMessage(chatId, '⏳ Question timed out (no answer).').catch(() => {});
+        settlePending(token, null);
+      }, AUQ_TIMEOUT_MS);
+
+      // /stop (or the agent timeout) aborts the turn — dismiss the pending
+      // question so it doesn't dangle until the timeout fires.
+      if (abortController) {
+        abortController.signal.addEventListener(
+          'abort',
+          () => {
+            const q = pendingQuestions.get(token);
+            if (q && !q.settled && q.messageId) {
+              void ctx.api
+                .editMessageText(q.chatId, q.messageId, '✖ Dismissed (turn stopped)')
+                .catch(() => {});
+            }
+            settlePending(token, null);
+          },
+          { once: true },
+        );
+      }
+
+      const pending: PendingQuestion = {
+        chatId: chatIdStr,
+        request,
+        selections: request.questions.map(() => []),
+        current: 0,
+        resolve,
+        timeout,
+        awaitingOther: false,
+        abortController,
+        markStopAsking: () => {
+          stopAsking = true;
+        },
+        settled: false,
+      };
+      pendingQuestions.set(token, pending);
+      pendingByChat.set(chatIdStr, token);
+
+      void ctx.api
+        .sendMessage(chatId, buildStepText(pending), {
+          reply_markup: buildStepKeyboard(token, pending),
+        })
+        .then((sent) => {
+          pending.messageId = sent.message_id;
+        })
+        .catch((err) => {
+          logger.warn({ err }, 'Failed to send AskUserQuestion keyboard');
+          settlePending(token, null);
+        });
+    });
+  };
+}
+
+/**
+ * Route a free-text message to a pending "Other" capture, if the current step
+ * is awaiting one. Returns true if the message was consumed as an answer.
+ */
+async function maybeCaptureOtherReply(ctx: Context, chatIdStr: string, message: string): Promise<boolean> {
+  const token = pendingByChat.get(chatIdStr);
+  if (!token) return false;
+  const q = pendingQuestions.get(token);
+  if (!q || !q.awaitingOther) return false;
+
+  q.selections[q.current] = [message.trim()];
+  q.awaitingOther = false;
+  // Record only — re-render the step so the user can Next/Done from here.
+  if (q.messageId) {
+    await ctx.api
+      .editMessageText(q.chatId, q.messageId, `${buildStepText(q)}\n(your answer: ${message.trim()})`, {
+        reply_markup: buildStepKeyboard(token, q),
+      })
+      .catch(() => {});
+  }
+  return true;
+}
+
+/** Register the callback_query handler that consumes inline-keyboard taps. */
+function registerAuqCallbackHandler(bot: Bot): void {
+  bot.on('callback_query:data', async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith('auq:')) return; // not ours
+    const parts = data.split(':'); // auq:<token>:<action>[:<oIdx>]
+    const token = parts[1];
+    const action = parts[2];
+    const q = pendingQuestions.get(token);
+    if (!q) {
+      await ctx.answerCallbackQuery({ text: 'This question has expired.' }).catch(() => {});
+      return;
+    }
+
+    const cur = q.request.questions[q.current];
+
+    // Stop: truly exit the turn loop (mirrors /stop). Distinct from Skip.
+    if (action === 'stop') {
+      await ctx.answerCallbackQuery({ text: 'Stopping the turn' }).catch(() => {});
+      if (q.messageId) {
+        await ctx.api
+          .editMessageText(q.chatId, q.messageId, '✖ Stopped (turn aborted)')
+          .catch(() => {});
+      }
+      // Settle first so the abort listener doesn't double-edit, then abort the
+      // turn so the agent stops rather than continuing without an answer.
+      settlePending(token, null);
+      q.abortController?.abort();
+      return;
+    }
+
+    // Done: finalise with whatever has been answered so far (unanswered
+    // questions are reported as skipped) and let the turn continue.
+    if (action === 'done') {
+      await ctx.answerCallbackQuery({ text: 'Done' }).catch(() => {});
+      await finalizeQuestion(ctx.api, token);
+      return;
+    }
+
+    // Proceed: submit and end the Q&A flow for the rest of the turn.
+    if (action === 'proceed') {
+      await ctx.answerCallbackQuery({ text: 'Proceeding' }).catch(() => {});
+      await finalizeWithProceed(ctx.api, token);
+      return;
+    }
+
+    // Next: cycle to the next question (wraps last → first).
+    if (action === 'next') {
+      await ctx.answerCallbackQuery().catch(() => {});
+      await advanceStep(ctx.api, token);
+      return;
+    }
+
+    // Other: capture the answer to the current question as free text.
+    if (action === 'other') {
+      q.awaitingOther = true;
+      await ctx.answerCallbackQuery({ text: 'Type your answer as a message.' }).catch(() => {});
+      await ctx.api
+        .sendMessage(q.chatId, `✏️ Type your answer for: ${cur.question}`)
+        .catch(() => {});
+      return;
+    }
+
+    // Option tap.
+    if (action === 'opt') {
+      const oIdx = Number(parts[3]);
+      const opt = cur.options[oIdx];
+      if (!opt) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        return;
+      }
+      if (cur.multiSelect) {
+        // Toggle; stay on this step until Next/Done.
+        const sel = q.selections[q.current] ?? [];
+        q.selections[q.current] = sel.includes(opt.label)
+          ? sel.filter((l) => l !== opt.label)
+          : [...sel, opt.label];
+      } else {
+        // Single-select: replace the selection; advancing is the Next tap.
+        q.selections[q.current] = [opt.label];
+      }
+      // Mark only — re-render so the ✓ shows; the user taps Next to advance.
+      await ctx.answerCallbackQuery({ text: `Selected: ${opt.label}` }).catch(() => {});
+      if (q.messageId) {
+        await ctx.api
+          .editMessageReplyMarkup(q.chatId, q.messageId, { reply_markup: buildStepKeyboard(token, q) })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    await ctx.answerCallbackQuery().catch(() => {});
+  });
+}
+
+// Set in createBot() so the module-level emergency-kill path can drain the
+// killing update before exit without threading the Bot through every caller.
+let botRef: Bot | undefined;
+
+// Advance Telegram's offset past the kill message so a supervisor restart
+// (systemd Restart=always) does not redeliver it and re-trigger the kill.
+// Stops the long-poller first — a concurrent getUpdates would 409-conflict.
+//
+// Both steps are time-boxed: grammY's bot.stop() waits for in-flight update
+// processing to settle, and this runs *inside* the killing handler, so an
+// unbounded await could deadlock and starve the caller's process.exit
+// watchdog. A hard cap guarantees we always fall through to the kill.
+async function drainKillUpdate(ctx: Context): Promise<void> {
+  const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T | void> =>
+    Promise.race([p.catch(() => {}), new Promise<void>((r) => setTimeout(r, ms).unref?.())]);
+  if (botRef) await withTimeout(botRef.stop(), 2000);
+  await withTimeout(
+    ctx.api.getUpdates({ offset: ctx.update.update_id + 1, limit: 1, timeout: 0 }),
+    2000,
+  );
+}
+
 async function handleMessage(ctx: Context, message: string, forceVoiceReply = false, skipLog = false): Promise<void> {
   const chatId = ctx.chat!.id;
   const chatIdStr = chatId.toString();
@@ -507,6 +967,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   if (checkKillPhrase(message)) {
     audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill triggered', blocked: false });
     await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+    await drainKillUpdate(ctx);
     executeEmergencyKill();
     return;
   }
@@ -527,6 +988,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   // Record activity for idle timer
   touchActivity();
+
+  // ── AskUserQuestion "Other" capture ─────────────────────────────
+  // If a pending question in this chat is awaiting a free-text "Other" reply,
+  // consume this message as the answer instead of starting a new agent turn.
+  if (await maybeCaptureOtherReply(ctx, chatIdStr, message)) {
+    return;
+  }
 
   // Audit the incoming message
   audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'message', detail: message.slice(0, 200), blocked: false });
@@ -591,7 +1059,10 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   // Build memory context and prepend to message
   const { contextText: memCtx, surfacedMemoryIds, surfacedMemorySummaries } = await buildMemoryContext(chatIdStr, message, AGENT_ID);
   const parts: string[] = [];
-  if (agentSystemPrompt && !sessionId) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
+  // Only inject the persona in-band for engines that can't carry it in a system
+  // prompt (ACP). On the Claude SDK path it's already pinned there every turn, so
+  // injecting again would just duplicate it on the first turn.
+  if (agentSystemPrompt && !sessionId && !engineSupportsSystemPrompt(agentProvider)) parts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
   if (memCtx) parts.push(memCtx);
 
   // Inject recent scheduled task outputs so the user can reply to them naturally.
@@ -614,10 +1085,13 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
   const fullMessage = parts.join('\n\n');
 
   // Smart model routing: use cheap model for simple acknowledgments
-  const userModel = chatModelOverride.get(chatIdStr) ?? agentDefaultModel;
-  const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
+  const provider = activeProvider();
+  const userModel = provider.type === 'claude'
+    ? (chatModelOverride.get(chatIdStr) ?? agentDefaultModel ?? provider.model)
+    : undefined;
+  const effectiveModel = provider.type === 'claude' && SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple'
     ? SMART_ROUTING_CHEAP_MODEL
-    : (userModel ?? 'claude-opus-4-6');
+    : (userModel ?? (provider.type === 'claude' ? DEFAULT_CLAUDE_MODEL : undefined));
 
   // Start typing immediately, then refresh on interval
   await sendTyping(ctx.api, chatId);
@@ -630,20 +1104,41 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
 
   try {
     // Progress callback: surface agent activity to Telegram + SSE.
-    // Tool activity is throttled to one Telegram update per 30s to avoid spam.
+    // Tool activity is throttled to avoid spam. ACP providers
+    // (codex/gemini/opencode) can run long, text-silent tool chains where the
+    // only feedback is the typing indicator, so a multi-minute sequence reads as
+    // a hang (#86). They get a faster heartbeat; Claude streams text and keeps
+    // the slower cadence.
     let lastToolNotifyTime = 0;
     let lastToolDesc = '';
-    const TOOL_NOTIFY_INTERVAL_MS = 30_000;
+    const TOOL_NOTIFY_INTERVAL_MS = provider.type === 'claude' ? 30_000 : 12_000;
 
     const onProgress = (event: AgentProgressEvent) => {
+      const progressPayload = {
+        type: 'progress' as const,
+        chatId: chatIdStr,
+        description: event.description,
+        progressKind: event.type,
+        status: event.status,
+        kind: event.kind,
+        toolCallId: event.toolCallId,
+        locations: event.locations,
+        planEntries: event.planEntries,
+      };
       if (event.type === 'task_started') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+        emitChatEvent(progressPayload);
         void ctx.reply(`🔄 ${event.description}`).catch(() => {});
       } else if (event.type === 'task_completed') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
-        void ctx.reply(`✓ ${event.description}`).catch(() => {});
+        emitChatEvent(progressPayload);
+        // Only notify Telegram for meaningful completions (sub-agent results),
+        // not generic "Tool result" from every individual tool call.
+        if (event.description !== 'Tool result') {
+          void ctx.reply(`✓ ${event.description}`).catch(() => {});
+        }
+      } else if (event.type === 'plan') {
+        emitChatEvent(progressPayload);
       } else if (event.type === 'tool_active') {
-        emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+        emitChatEvent(progressPayload);
         lastToolDesc = event.description;
         // Only send tool notifications to Telegram if streaming is off.
         // When streaming is active, the live text updates already show progress.
@@ -709,6 +1204,9 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
       },
       MODEL_FALLBACK_CHAIN.length > 0 ? MODEL_FALLBACK_CHAIN : undefined,
       agentMcpAllowlist,
+      provider,
+      chatToolPolicyFor(provider),
+      makeAskUserQuestionResolver(ctx, chatId, abortCtrl),
     );
 
     clearTimeout(timeoutId);
@@ -773,7 +1271,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
     const { text: responseText, files: fileMarkers } = extractFileMarkers(rawResponse);
 
     // Add cost footer
-    const costFooter = buildCostFooter(SHOW_COST_FOOTER, result.usage, effectiveModel);
+    const costFooter = buildCostFooter(SHOW_COST_FOOTER, result.usage, effectiveModel ?? provider.type);
 
     // Save conversation turn to memory (including full log).
     // Skip logging for synthetic messages like /respin to avoid self-referential growth.
@@ -847,6 +1345,7 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
+          result.usage.contextWindow,
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
@@ -959,6 +1458,7 @@ export function createBot(): Bot {
   }
 
   const bot = new Bot(token);
+  botRef = bot; // expose for the module-level emergency-kill drain
 
   // Reject group chats. ClaudeClaw only works in private (1-on-1) chats.
   // This prevents message leakage if the bot is added to a group.
@@ -971,14 +1471,39 @@ export function createBot(): Bot {
     await next();
   });
 
+  // Inline-keyboard taps for AskUserQuestion (tap-to-choose answers).
+  registerAuqCallbackHandler(bot);
+
   // Register callback for high-importance memory notifications.
   // When a memory with importance >= 0.8 is created, notify via Telegram
   // so the user can /pin it if it should be permanent.
-  if (ALLOWED_CHAT_ID) {
+  if (ALLOWED_CHAT_ID && MEMORY_NOTIFY) {
     setHighImportanceCallback((memoryId, summary, importance) => {
       const msg = `🧠 New memory #${memoryId} [${importance.toFixed(1)}]: ${summary.slice(0, 200)}\n\n/pin ${memoryId} to make permanent`;
       bot.api.sendMessage(ALLOWED_CHAT_ID, msg).catch(() => {});
     });
+  }
+
+  // One-time memory-isolation notice (#96 follow-up). Existing multi-agent
+  // installs had cross-agent shared recall as their lived-in behaviour; the
+  // #96 fix flips them to per-agent isolation on upgrade. Surface that change
+  // once, from the primary agent only (so it isn't sent N times). The migration
+  // stamp sets the 'pending' flag only for installs that had >1 agent before
+  // upgrading; fresh/single-agent installs never see it. We claim the notice
+  // atomically (flip to 'sent' before sending) so a restart can't re-fire it.
+  // Informational only — reverting to shared recall is a documented setting
+  // (see README "Memory isolation"); we deliberately do not add install-wide
+  // slash commands that would clutter every agent's menu.
+  if (ALLOWED_CHAT_ID && AGENT_ID === resolvePrimaryAgentId() && getMemoryMigrationNotice() === 'pending') {
+    setMemoryMigrationNotice('sent');
+    const notice =
+      '🧠 <b>Heads up: memory recall is now per-agent.</b>\n\n' +
+      'Each of your agents now recalls only its own memories plus anything explicitly shared. ' +
+      'This closes a cross-agent leak where one agent could absorb another agent’s disposition.\n\n' +
+      'Some of your existing memories are genuinely system-wide (date handling, deploy steps, the agent roster, lane rules). They stay private until promoted to the shared tier.\n\n' +
+      'See the README (“Memory isolation”) for details, how to promote shared memories, and how to revert to shared recall if you need it.\n\n' +
+      'Doing nothing keeps the safer per-agent default.';
+    bot.api.sendMessage(ALLOWED_CHAT_ID, notice, { parse_mode: 'HTML' }).catch(() => {});
   }
 
   // Register commands in the Telegram menu (built-in + auto-discovered skills)
@@ -989,6 +1514,7 @@ export function createBot(): Bot {
     { command: 'respin', description: 'Reload recent context' },
     { command: 'voice', description: 'Toggle voice mode on/off' },
     { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
+    { command: 'provider', description: 'Show active provider' },
     { command: 'memory', description: 'View recent memories' },
     { command: 'forget', description: 'Clear session' },
     { command: 'wa', description: 'Recent WhatsApp messages' },
@@ -1015,6 +1541,7 @@ export function createBot(): Bot {
       '/respin — Reload recent context\n' +
       '/voice — Toggle voice mode on/off\n' +
       '/model — Switch model (opus/sonnet/haiku)\n' +
+      '/provider — Show active provider/model source\n' +
       '/memory — View recent memories\n' +
       '/forget — Clear session\n' +
       '/wa — WhatsApp messages\n' +
@@ -1075,6 +1602,9 @@ export function createBot(): Bot {
             undefined,
             undefined,
             summaryAbort,
+            undefined,
+            undefined,
+            activeProvider(),
           );
           clearTimeout(summaryTimer);
 
@@ -1150,43 +1680,87 @@ export function createBot(): Bot {
     }
   });
 
-  // /model — switch Claude model (opus, sonnet, haiku)
+  // /model — switch Claude model (opus, sonnet, haiku shortcuts, or any
+  // full claude-* id, e.g. /model claude-sonnet-4-5). Changes PERSIST to
+  // agent.yaml — the same provider block the dashboard writes — and take
+  // effect immediately in-process. Telegram, dashboard, and agent.yaml
+  // are one synced store; there is no temporary per-chat override.
   bot.command('model', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
     const chatIdStr = ctx.chat!.id.toString();
+    // Clear any pre-persistence chat override so the persisted value is
+    // what actually runs (the override map outranks it in the query path).
+    chatModelOverride.delete(chatIdStr);
+    const provider = activeProvider();
+    if (provider.type !== 'claude') {
+      await ctx.reply(`Active provider: ${getProviderDisplay(provider)}\n/model only applies to Claude. Use npm run provider:setup or the dashboard to change provider/model settings.`);
+      return;
+    }
     const arg = ctx.match?.trim().toLowerCase();
 
+    const persist = (next: ProviderConfig): void => {
+      if (AGENT_ID === 'main') setMainProviderConfig(next);
+      else setAgentProvider(AGENT_ID, next);
+      updateAgentProvider(next); // in-memory, effective this turn
+    };
+
     if (!arg) {
-      const current = chatModelOverride.get(chatIdStr);
-      const currentLabel = current
-        ? Object.entries(AVAILABLE_MODELS).find(([, v]) => v === current)?.[0] ?? current
-        : DEFAULT_MODEL_LABEL + ' (default)';
+      const effective = agentDefaultModel ?? provider.model ?? DEFAULT_CLAUDE_MODEL;
+      const label = Object.entries(AVAILABLE_MODELS).find(([, v]) => v === effective)?.[0] ?? effective;
+      const source = agentDefaultModel || provider.model ? 'agent.yaml' : 'default';
       const models = Object.keys(AVAILABLE_MODELS).join(', ');
-      await ctx.reply(`Current model: ${currentLabel}\nAvailable: ${models}\n\nUsage: /model haiku`);
+      await ctx.reply(`Current model: ${label} (${source})\nShortcuts: ${models}\nOr a full id: /model claude-sonnet-4-5\n\nChanges persist (agent.yaml), same as the dashboard picker.`);
       return;
     }
 
-    if (arg === 'reset' || arg === 'default' || arg === 'opus') {
-      chatModelOverride.delete(chatIdStr);
-      await ctx.reply('Model reset to default (opus)');
+    if (arg === 'reset' || arg === 'default') {
+      // Drop the persisted model so the provider default applies.
+      const next: ProviderConfig = { ...provider };
+      delete next.model;
+      try {
+        persist(next);
+      } catch (err) {
+        await ctx.reply(`Failed to persist: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      await ctx.reply(`Model reset to default: ${DEFAULT_CLAUDE_MODEL} (persisted)`);
       return;
     }
 
-    const modelId = AVAILABLE_MODELS[arg];
+    // Shortcut label, or any full claude-* model id. Same format gate as
+    // the dashboard set-model endpoints — the SDK 404s clearly on first
+    // use if the id doesn't exist, which is the real validator.
+    const modelId = AVAILABLE_MODELS[arg]
+      ?? (/^claude-[a-z0-9][a-z0-9.-]*$/.test(arg) ? arg : undefined);
     if (!modelId) {
-      await ctx.reply(`Unknown model: ${arg}\nAvailable: ${Object.keys(AVAILABLE_MODELS).join(', ')}`);
+      await ctx.reply(`Unknown model: ${arg}\nShortcuts: ${Object.keys(AVAILABLE_MODELS).join(', ')}\nOr a full id, e.g. /model claude-sonnet-4-5`);
       return;
     }
 
-    chatModelOverride.set(chatIdStr, modelId);
-    await ctx.reply(`Model changed: ${arg} (${modelId})`);
+    try {
+      persist({ ...provider, model: modelId });
+    } catch (err) {
+      await ctx.reply(`Failed to persist: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    await ctx.reply(`Model changed: ${arg === modelId ? modelId : `${arg} (${modelId})`}\nPersisted to agent.yaml — applies everywhere until changed again.`);
   });
 
-  // /memory — show recent memories for this chat
+  // /provider — display active provider/model source only.
+  bot.command('provider', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const provider = activeProvider();
+    const modelLine = modelStatusLine(provider, ctx.chat!.id.toString());
+    await ctx.reply(`Provider: ${getProviderDisplay(provider)}\n${modelLine}`);
+  });
+
+  // /memory — show recent memories for this agent on this chat
   bot.command('memory', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
     const chatId = ctx.chat!.id.toString();
-    const recent = getRecentMemories(chatId, 10);
+    // Scope to this agent + shared tier so the dump matches the recall path
+    // (#95/#96). Matters when agents share a chat_id but hold separate context.
+    const recent = getRecentMemories(chatId, 10, AGENT_ID);
     if (recent.length === 0) {
       await ctx.reply('No memories yet.');
       return;
@@ -1197,7 +1771,15 @@ export function createBot(): Bot {
       const pin = m.pinned ? ' 📌' : '';
       return `<b>#${m.id}</b> [${m.importance.toFixed(1)}]${pin} ${escapeHtml(m.summary)}${topicStr}`;
     }).join('\n');
-    await ctx.reply(`<b>Recent memories</b>\n\n${lines}\n\n<i>/pin &lt;id&gt; to make permanent, /unpin &lt;id&gt; to remove</i>`, { parse_mode: 'HTML' });
+    // Route through splitMessage: a full set of recent memories routinely
+    // exceeds Telegram's 4096-char cap, and a single oversized ctx.reply is
+    // rejected (HTTP 400) so the user sees nothing. Every other long-output
+    // path in this file already chunks; /memory was the one that did not.
+    // Splitting on newline boundaries keeps each memory line's HTML balanced.
+    const memoryReply = `<b>Recent memories</b>\n\n${lines}\n\n<i>/pin &lt;id&gt; to make permanent, /unpin &lt;id&gt; to remove</i>`;
+    for (const part of splitMessage(memoryReply)) {
+      await ctx.reply(part, { parse_mode: 'HTML' });
+    }
   });
 
   // /pin <id> — make a memory permanent (never decays)
@@ -1311,9 +1893,16 @@ export function createBot(): Bot {
     const base = DASHBOARD_URL || `http://localhost:${DASHBOARD_PORT}`;
     const url = `${base}/?token=${DASHBOARD_TOKEN}&chatId=${chatIdStr}`;
 
-    const { InlineKeyboard } = await import('grammy');
-    const keyboard = new InlineKeyboard().url('Open Dashboard', url);
-    await ctx.reply('Dashboard', { reply_markup: keyboard });
+    if (canUseTelegramUrlButton(url)) {
+      const { InlineKeyboard } = await import('grammy');
+      const keyboard = new InlineKeyboard().url('Open Dashboard', url);
+      await ctx.reply('Dashboard', { reply_markup: keyboard });
+      return;
+    }
+
+    await ctx.reply(
+      `Dashboard is running locally:\n${url}\n\nTelegram cannot open localhost links as buttons. Open this on the machine running ClaudeClaw, or set DASHBOARD_URL to a public tunnel URL for phone access.`,
+    );
   });
 
   // /stop — interrupt the current agent query
@@ -1392,7 +1981,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -1406,6 +1995,7 @@ export function createBot(): Bot {
     if (checkKillPhrase(text)) {
       audit({ agentId: AGENT_ID, chatId: chatIdStr, action: 'kill', detail: 'Emergency kill via text handler', blocked: false });
       await ctx.reply('EMERGENCY KILL activated. All agents stopping.');
+      await drainKillUpdate(ctx);
       executeEmergencyKill();
       return;
     }
@@ -1737,7 +2327,7 @@ async function processDashboardMessage(
 
     const { contextText: memCtx, surfacedMemoryIds: dashSurfacedIds, surfacedMemorySummaries: dashSummaries } = await buildMemoryContext(chatIdStr, text, AGENT_ID);
     const dashParts: string[] = [];
-    if (agentSystemPrompt && !sessionId) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
+    if (agentSystemPrompt && !sessionId && !engineSupportsSystemPrompt(agentProvider)) dashParts.push(`[Agent role — follow these instructions]\n${agentSystemPrompt}\n[End agent role]`);
     if (memCtx) dashParts.push(memCtx);
 
     const recentDashTasks = getRecentTaskOutputs(AGENT_ID, 30);
@@ -1753,7 +2343,17 @@ async function processDashboardMessage(
     const fullMessage = dashParts.join('\n\n');
 
     const onProgress = (event: AgentProgressEvent) => {
-      emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+      emitChatEvent({
+        type: 'progress',
+        chatId: chatIdStr,
+        description: event.description,
+        progressKind: event.type,
+        status: event.status,
+        kind: event.kind,
+        toolCallId: event.toolCallId,
+        locations: event.locations,
+        planEntries: event.planEntries,
+      });
     };
 
     const abortCtrl = new AbortController();
@@ -1763,6 +2363,7 @@ async function processDashboardMessage(
       abortCtrl.abort();
     }, AGENT_TIMEOUT_MS);
 
+    const dashProvider = activeProvider();
     const result = await runAgent(
       fullMessage,
       sessionId,
@@ -1772,6 +2373,8 @@ async function processDashboardMessage(
       abortCtrl,
       undefined, // no streaming for dashboard
       agentMcpAllowlist,
+      dashProvider,
+      chatToolPolicyFor(dashProvider),
     );
 
     clearTimeout(dashTimeout);
@@ -1870,6 +2473,7 @@ async function processDashboardMessage(
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
+          result.usage.contextWindow,
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
@@ -1878,7 +2482,10 @@ async function processDashboardMessage(
   } catch (err) {
     setActiveAbort(chatIdStr, null);
     logger.error({ err }, 'Dashboard message processing error');
-    emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    const userMessage = err instanceof AgentError
+      ? err.recovery.userMessage
+      : 'Something went wrong. Check the logs.';
+    emitChatEvent({ type: 'error', chatId: chatIdStr, content: userMessage });
   } finally {
     setProcessing(chatIdStr, false);
   }

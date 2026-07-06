@@ -1,7 +1,7 @@
 {
   "name": "claudeclaw",
-  "version": "1.1.0",
-  "description": "Your personal Claude Code assistant, delivered to your phone via Telegram",
+  "version": "1.4.0",
+  "description": "Your personal local agent provider, delivered to your phone via Telegram",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -13,10 +13,13 @@
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "migrate": "tsx scripts/migrate.ts",
     "setup": "tsx scripts/setup.ts",
+    "provider:setup": "tsx scripts/provider-setup.ts",
+    "dashboard:open": "tsx scripts/open-dashboard.ts",
     "status": "tsx scripts/status.ts",
     "agent:create": "bash scripts/agent-create.sh",
     "agent:start": "node dist/index.js --agent",
@@ -24,18 +27,21 @@
     "build:warroom-client": "esbuild warroom/client.js --bundle --outfile=warroom/client.bundle.js --format=iife --global-name=PipecatWarRoom"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.34",
+    "@agentclientprotocol/sdk": "^0.21.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.197",
     "@google/genai": "^1.44.0",
     "@hono/node-server": "^1.19.9",
     "@monaco-editor/react": "^4.7.0",
     "@slack/web-api": "^7.14.1",
     "@types/three": "^0.184.0",
+    "@zed-industries/codex-acp": "^0.14.0",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
     "grammy": "^1.34.0",
     "hono": "^4.12.3",
     "js-yaml": "^4.1.1",
     "monaco-editor": "^0.55.1",
+    "openai": "^6.39.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
     "qrcode-terminal": "^0.12.0",
@@ -45,6 +51,7 @@
   "devDependencies": {
     "@pipecat-ai/client-js": "^1.7.0",
     "@pipecat-ai/websocket-transport": "^1.6.2",
+    "@playwright/test": "^1.59.1",
     "@preact/preset-vite": "^2.10.5",
     "@preact/signals": "^2.9.0",
     "@tailwindcss/vite": "^4.2.4",
@@ -67,7 +74,7 @@
     "wouter-preact": "^3.9.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22 <25"
   },
   "vitest": {
     "environment": "node",

@@ -11,6 +11,7 @@
 
 import crypto from 'crypto';
 import { execSync } from 'child_process';
+import fs from 'fs';
 import os from 'os';
 
 import { logger } from './logger.js';
@@ -131,6 +132,38 @@ export function checkKillPhrase(message: string): boolean {
 }
 
 /**
+ * Resolve the systemd unit that owns the current process by reading
+ * /proc/self/cgroup. Returns null when not running under systemd
+ * (Docker, pm2, nodemon, non-Linux). Ignores the manager unit
+ * (user@<uid>.service) and only reports the owning app unit.
+ */
+export function getOwnSystemdUnit(): { unit: string; userScope: boolean } | null {
+  try {
+    const raw = fs.readFileSync('/proc/self/cgroup', 'utf-8');
+    // cgroup v2: single "0::/path" line; v1: multiple "n:ctrl:/path" lines.
+    let userScope = false;
+    let owning: string | null = null;
+    for (const line of raw.split('\n')) {
+      const path = line.split(':').pop() || '';
+      const segments = path.split('/').filter(Boolean);
+      for (const seg of segments) {
+        if (/^user@\d+\.service$/.test(seg)) {
+          userScope = true; // manager unit — marks user scope, not the owner
+          continue;
+        }
+        if (seg.endsWith('.service') || seg.endsWith('.scope')) {
+          owning = seg; // last matching segment wins (deepest = closest owner)
+        }
+      }
+    }
+    if (!owning) return null;
+    return { unit: owning, userScope };
+  } catch {
+    return null; // no /proc, unreadable, or not systemd
+  }
+}
+
+/**
  * Execute the emergency shutdown.
  * Stops all ClaudeClaw services and force-exits after a brief timeout.
  */
@@ -154,20 +187,37 @@ export function executeEmergencyKill(): void {
         }
       } catch { /* launchctl failed, still exit */ }
     } else if (os.platform() === 'linux') {
+      // Stop sibling agent units via the glob (best-effort).
       try {
         execSync('systemctl --user stop "com.claudeclaw.*" 2>/dev/null', { stdio: 'ignore', timeout: 3000 });
       } catch { /* ok */ }
+      // Stop our OWN unit by exact name so systemd treats the exit as clean
+      // and does not restart it despite Restart=always. Guards:
+      //  - only a .service — never a .scope (an interactive shell's
+      //    session-*.scope, stopping which would kill the operator's SSH
+      //    session).
+      //  - only a unit whose name contains "claudeclaw" — otherwise a shared
+      //    supervisor (e.g. pm2-root.service) would own our cgroup and we'd
+      //    take down every unrelated app it manages. If the name doesn't
+      //    match, skip and fall back to process.exit (same as non-systemd).
+      const own = getOwnSystemdUnit();
+      if (own && own.unit.endsWith('.service') && /claudeclaw/i.test(own.unit)) {
+        const scope = own.userScope ? '--user' : '--system';
+        try {
+          execSync(`systemctl ${scope} stop --no-block ${own.unit} 2>/dev/null`, { stdio: 'ignore', timeout: 3000 });
+        } catch { /* best-effort; exit anyway */ }
+      }
     } else if (os.platform() === 'win32') {
       // Enumerate scheduled tasks matching com.claudeclaw.* and end each one.
       // schtasks doesn't accept wildcards in /End, so we parse /Query output.
       try {
-        const out = execSync('schtasks /Query /FO CSV /NH', { encoding: 'utf-8', timeout: 3000 });
+        const out = execSync('schtasks /Query /FO CSV /NH', { encoding: 'utf-8', timeout: 3000, windowsHide: true });
         for (const line of out.split(/\r?\n/)) {
           // CSV: "TaskName","Next Run Time","Status"
           const match = line.match(/^"(\\?com\.claudeclaw\.[^"]+)"/);
           if (match) {
             const name = match[1];
-            try { execSync(`schtasks /End /TN "${name}"`, { stdio: 'ignore', timeout: 2000 }); } catch { /* ok */ }
+            try { execSync(`schtasks /End /TN "${name}"`, { stdio: 'ignore', timeout: 2000, windowsHide: true }); } catch { /* ok */ }
           }
         }
       } catch { /* schtasks failed, still exit */ }
@@ -211,21 +261,19 @@ export function audit(entry: AuditEntry): void {
 
 // ── SDK subprocess env scrubbing ─────────────────────────────────────
 //
-// Every Claude Agent SDK call spawns a `claude` subprocess that inherits
-// our env. By default that means `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`,
-// `DAILY_API_KEY`, third-party API keys, etc. are visible to the model
-// and to whatever tools it runs. A prompt-injected agent can read them
-// trivially.
+// Every agent engine subprocess inherits our env unless we override it.
+// By default that means `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`,
+// `DAILY_API_KEY`, third-party API keys, etc. are visible to the model and
+// to whatever tools it runs. A prompt-injected agent can read them trivially.
 //
 // `getScrubbedSdkEnv` returns the env to pass to `query({ env, ... })`:
 //   - Drops nested Claude-Code-session state so the child SDK process
 //     doesn't try to attach to the parent's IPC socket (legacy bug).
 //   - Drops every secret-shaped variable the SDK doesn't actually need.
-//   - Preserves whichever of CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY
-//     the caller passed (SDK auth requires one of them; without one, the
-//     subprocess exits 1).
-//   - Resolves missing tokens from .env via readEnvFile so callers don't
-//     have to know how the secret is sourced.
+//   - Preserves CLAUDE_CODE_OAUTH_TOKEN when explicitly provided.
+//   - Drops ANTHROPIC_API_KEY by default so an invalid/stale external API
+//     key cannot override an existing Claude subscription login. Set
+//     CLAUDECLAW_USE_ANTHROPIC_API_KEY=true to force API-key auth.
 //
 // This is a blocklist (drop the dangerous), not a strict allowlist (keep
 // only the explicitly safe), to avoid breaking obscure-but-required env
@@ -269,8 +317,8 @@ const SDK_DROP_VARS_SECRETS = [
 
 // Heuristic: any env var whose name matches one of these patterns is a
 // likely secret (defense in depth for keys we haven't enumerated).
-// `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are exceptions —
-// the SDK needs them to authenticate.
+// CLAUDE_CODE_OAUTH_TOKEN is an exception because it is the explicit
+// subscription/OAuth auth override for the SDK subprocess.
 const SDK_SECRET_NAME_PATTERNS = [
   /_API_KEY$/,
   /_TOKEN$/,
@@ -279,6 +327,11 @@ const SDK_SECRET_NAME_PATTERNS = [
 ] as const;
 
 const SDK_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
+const SDK_ALWAYS_ALLOW_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN'] as const;
+
+function wantsAnthropicApiKeyAuth(): boolean {
+  return (process.env.CLAUDECLAW_USE_ANTHROPIC_API_KEY ?? '').toLowerCase() === 'true';
+}
 
 /**
  * Return a scrubbed env dict suitable for passing to `query({ env, ... })`.
@@ -289,6 +342,7 @@ const SDK_AUTH_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
 export function getScrubbedSdkEnv(
   authSecrets?: Partial<Record<typeof SDK_AUTH_VARS[number], string>>,
 ): Record<string, string | undefined> {
+  const processAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
   const env: Record<string, string | undefined> = { ...process.env };
 
   for (const k of SDK_DROP_VARS_NESTED_CLAUDE) delete env[k];
@@ -297,19 +351,32 @@ export function getScrubbedSdkEnv(
   // Pattern-based drop. Walk a snapshot of keys so we can mutate the
   // dict during iteration.
   for (const key of Object.keys(env)) {
-    if ((SDK_AUTH_VARS as readonly string[]).includes(key)) continue;
+    if ((SDK_ALWAYS_ALLOW_AUTH_VARS as readonly string[]).includes(key)) continue;
     if (SDK_SECRET_NAME_PATTERNS.some((re) => re.test(key))) {
       delete env[key];
     }
   }
 
-  // Re-inject auth secrets the caller explicitly opted to allow. Without
-  // at least one of these, the SDK subprocess can't authenticate.
+  // Subscription/OAuth auth can come from the user's existing Claude CLI
+  // login state, so no env token is required. Re-inject an API key only
+  // when the operator explicitly chooses API-key auth.
   if (authSecrets) {
-    for (const k of SDK_AUTH_VARS) {
-      const v = authSecrets[k];
-      if (v) env[k] = v;
-    }
+    const oauthToken = authSecrets.CLAUDE_CODE_OAUTH_TOKEN;
+    if (oauthToken) env.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
+
+    const apiKey = authSecrets.ANTHROPIC_API_KEY;
+    if (apiKey && wantsAnthropicApiKeyAuth()) env.ANTHROPIC_API_KEY = apiKey;
+  }
+  if (!env.ANTHROPIC_API_KEY && processAnthropicApiKey && wantsAnthropicApiKeyAuth()) {
+    env.ANTHROPIC_API_KEY = processAnthropicApiKey;
+  }
+
+  // Claude Code refuses --dangerously-skip-permissions under root/sudo
+  // unless IS_SANDBOX=1 is present. Required for containerized/systemd
+  // root deployments. No-op on Windows/macOS (getuid undefined) and
+  // for non-root users. Respects an explicit operator override.
+  if (typeof process.getuid === 'function' && process.getuid() === 0 && !env.IS_SANDBOX) {
+    env.IS_SANDBOX = '1';
   }
 
   return env;

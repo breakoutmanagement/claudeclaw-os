@@ -53,7 +53,38 @@ const AUTH_PATTERNS = [
   'token expired',
   'invalid_grant',
   'login required',
+  'no credentials',
+  'please run claude login',
+  // The unauthenticated `claude` CLI returns a result (is_error:true) with this
+  // exact text rather than throwing — detected in claude-sdk-adapter (#48).
+  'not logged in',
+  'please run /login',
 ];
+
+// Shown for any auth failure. Covers both local (claude login) and the common
+// headless/cloud-deploy case where neither token env var is set (#48).
+const AUTH_FAILED_MESSAGE =
+  'Claude Code is not authenticated. Locally: run `claude login` (or `claude setup-token`). '
+  + 'On a headless / cloud deploy (Railway, Fly, Render): set CLAUDE_CODE_OAUTH_TOKEN '
+  + '(from `claude setup-token`) or ANTHROPIC_API_KEY in the environment.';
+
+/** True if error/result text indicates a Claude auth failure. Shared so the
+ *  SDK adapter can detect the is_error result-message case (#48), not just
+ *  thrown errors. */
+export function isAuthErrorText(text: string): boolean {
+  return matchesAny(text, AUTH_PATTERNS);
+}
+
+/** Standard non-retryable auth AgentError with deploy-aware guidance. */
+export function authError(original?: Error): AgentError {
+  return new AgentError('auth', {
+    shouldRetry: false,
+    shouldNewChat: false,
+    shouldSwitchModel: false,
+    retryAfterMs: 0,
+    userMessage: AUTH_FAILED_MESSAGE,
+  }, original);
+}
 
 const RATE_LIMIT_PATTERNS = [
   'rate limit',
@@ -110,9 +141,36 @@ const CONTEXT_PATTERNS = [
   'token limit',
 ];
 
+const COMMAND_NOT_FOUND_PATTERNS = [
+  'enoent',
+  'command not found',
+  'failed to start acp provider command',
+];
+
 function matchesAny(text: string, patterns: string[]): boolean {
   const lower = text.toLowerCase();
   return patterns.some((p) => lower.includes(p));
+}
+
+function commandFromStartError(text: string): string | null {
+  const match = text.match(/Failed to start ACP provider command "([^"]+)"/i);
+  return match?.[1] ?? null;
+}
+
+function providerStartMessage(command: string | null): string {
+  if (command === 'opencode') {
+    return 'OpenCode could not be started. Make sure `opencode` is installed and available on PATH for the ClaudeClaw service.';
+  }
+  if (command === 'gemini') {
+    return 'Gemini CLI could not be started. Make sure `gemini` is installed, authenticated, and available on PATH for the ClaudeClaw service.';
+  }
+  if (command === 'codex-acp') {
+    return 'Codex ACP could not be started. ClaudeClaw uses `codex-acp` to connect to your existing signed-in Codex CLI account. Run `codex` once to confirm you are signed in, then reinstall dependencies and restart ClaudeClaw if the adapter is missing.';
+  }
+  if (command) {
+    return `ACP provider command \`${command}\` could not be started. Make sure it is installed and available on PATH for the ClaudeClaw service.`;
+  }
+  return 'ACP provider could not be started. Make sure the selected provider command is installed and available on PATH for the ClaudeClaw service.';
 }
 
 // ── Classification ──────────────────────────────────────────────────
@@ -140,6 +198,20 @@ export function classifyError(err: unknown, contextTokens?: number): AgentError 
     }, raw);
   }
 
+  // Missing/invalid Claude Code credentials surface as an immediate code-1
+  // exit. Classify as auth (no retry) BEFORE the generic crash branch below,
+  // otherwise ClaudeClaw retries a fundamentally unauthenticated subprocess
+  // forever with no actionable message — the common headless-deploy trap (#48).
+  if (matchesAny(text, AUTH_PATTERNS)) {
+    return new AgentError('auth', {
+      shouldRetry: false,
+      shouldNewChat: false,
+      shouldSwitchModel: false,
+      retryAfterMs: 0,
+      userMessage: AUTH_FAILED_MESSAGE,
+    }, raw);
+  }
+
   // Subprocess crash without context data
   if (text.includes('exited with code 1')) {
     return new AgentError('subprocess_crash', {
@@ -161,13 +233,13 @@ export function classifyError(err: unknown, contextTokens?: number): AgentError 
     }, raw);
   }
 
-  if (matchesAny(text, AUTH_PATTERNS)) {
-    return new AgentError('auth', {
+  if (matchesAny(text, COMMAND_NOT_FOUND_PATTERNS)) {
+    return new AgentError('subprocess_crash', {
       shouldRetry: false,
       shouldNewChat: false,
       shouldSwitchModel: false,
       retryAfterMs: 0,
-      userMessage: 'Authentication failed. Run `claude login` in your terminal to re-authenticate.',
+      userMessage: providerStartMessage(commandFromStartError(text)),
     }, raw);
   }
 

@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { readEnvFile } from './env.js';
+import type { ProviderConfig } from './provider.js';
 
 const envConfig = readEnvFile([
   'TELEGRAM_BOT_TOKEN',
@@ -14,6 +15,7 @@ const envConfig = readEnvFile([
   'SLACK_USER_TOKEN',
   'CONTEXT_LIMIT',
   'DASHBOARD_PORT',
+  'DASHBOARD_BIND',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
   'DASHBOARD_BIND',
@@ -29,6 +31,8 @@ const envConfig = readEnvFile([
   'SMART_ROUTING_ENABLED',
   'SMART_ROUTING_CHEAP_MODEL',
   'SHOW_COST_FOOTER',
+  'MEMORY_NOTIFY',
+  'MEMORY_RECALL_MODE',
   'DAILY_COST_BUDGET',
   'HOURLY_TOKEN_BUDGET',
   'MEMORY_NUDGE_INTERVAL_TURNS',
@@ -38,6 +42,10 @@ const envConfig = readEnvFile([
   'WARROOM_ENABLED',
   'WARROOM_PORT',
   'STREAM_STRATEGY',
+  'ENABLE_ACP',
+  'OPENROUTER_API_KEY',
+  'OPENROUTER_MODEL',
+  'CLAUDECLAW_STORE_DIR',
 ]);
 
 // ── Multi-agent support ──────────────────────────────────────────────
@@ -47,6 +55,7 @@ export let activeBotToken =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 export let agentCwd: string | undefined; // undefined = use PROJECT_ROOT
 export let agentDefaultModel: string | undefined; // from agent.yaml
+export let agentProvider: ProviderConfig | undefined; // from agent.yaml/main-config
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
 export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
@@ -56,6 +65,7 @@ export function setAgentOverrides(opts: {
   botToken: string;
   cwd: string;
   model?: string;
+  provider?: ProviderConfig;
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
   mcpServers?: string[];
@@ -64,6 +74,7 @@ export function setAgentOverrides(opts: {
   activeBotToken = opts.botToken;
   agentCwd = opts.cwd;
   agentDefaultModel = opts.model;
+  agentProvider = opts.provider;
   agentObsidianConfig = opts.obsidian;
   agentSystemPrompt = opts.systemPrompt;
   agentMcpAllowlist = opts.mcpServers;
@@ -76,6 +87,17 @@ export function setAgentOverrides(opts: {
  *  re-reads CLAUDE.md from cwd via settingSources on every turn. */
 export function updateAgentSystemPrompt(next: string | undefined): void {
   agentSystemPrompt = next;
+}
+
+/** Update just the active provider for the running process. Dashboard
+ * provider changes persist to disk separately; this keeps main hot-switches
+ * honest without rebuilding the full agent override object. */
+export function updateAgentProvider(next: ProviderConfig | undefined): void {
+  agentProvider = next;
+  // A provider block supersedes any legacy top-level `model:` loaded at
+  // boot — persisting removes it from agent.yaml, so drop the stale
+  // in-memory copy too (it outranks provider.model in the query path).
+  agentDefaultModel = undefined;
 }
 
 export const TELEGRAM_BOT_TOKEN =
@@ -103,7 +125,24 @@ const __dirname = path.dirname(__filename);
 // The SDK uses this as cwd, which causes Claude Code to load our CLAUDE.md
 // and all global skills from ~/.claude/skills/ via settingSources.
 export const PROJECT_ROOT = path.resolve(__dirname, '..');
-export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
+
+// STORE_DIR holds the SQLite database, PID locks and avatars. Defaults to
+// PROJECT_ROOT/store. Set CLAUDECLAW_STORE_DIR (env or .env) to point at an
+// external store directory — e.g. to run several builds against one shared
+// database. ~/... is expanded. (expandHome is hoisted, defined just below.)
+const rawStoreDir =
+  process.env.CLAUDECLAW_STORE_DIR || envConfig.CLAUDECLAW_STORE_DIR || '';
+export const STORE_DIR = rawStoreDir
+  ? expandHome(rawStoreDir)
+  : path.resolve(PROJECT_ROOT, 'store');
+
+// War Room IPC scratch (roster + pin files shared with the Python voice
+// stack). Kept repo-relative under store/ — deliberately NOT under STORE_DIR's
+// optional CLAUDECLAW_STORE_DIR relocation — so the Node and Python sides
+// resolve the exact same absolute path without sharing the relocation logic.
+// Replaces the old hardcoded /tmp/, which on Windows resolved to the drive
+// root (D:\tmp). Mirrored in warroom/config.py.
+export const WARROOM_TMP_DIR = path.resolve(PROJECT_ROOT, 'store', 'tmp');
 
 // ── External config directory ────────────────────────────────────────
 // Personal config files (CLAUDE.md, agent.yaml, agent CLAUDE.md) can live
@@ -153,8 +192,11 @@ export const AGENT_MAX_TURNS = parseInt(
   10,
 );
 
-// Context window limit for the model. Opus 4.6 (1M context) = 1,000,000.
-// Override via CONTEXT_LIMIT in .env if using a different model variant.
+// Fallback context-window limit (tokens). The context gauge and warnings now
+// prefer the active model's REAL window as reported by the SDK per turn
+// (Opus 4.8 = 1M, Sonnet 4.6 = 200k). This value is only used when the engine
+// doesn't report one — e.g. ACP providers, or rows from before the upgrade.
+// Override via CONTEXT_LIMIT in .env to change that fallback.
 export const CONTEXT_LIMIT = parseInt(
   process.env.CONTEXT_LIMIT || envConfig.CONTEXT_LIMIT || '1000000',
   10,
@@ -165,12 +207,12 @@ export const DASHBOARD_PORT = parseInt(
   process.env.DASHBOARD_PORT || envConfig.DASHBOARD_PORT || '3141',
   10,
 );
+export const DASHBOARD_BIND =
+  (process.env.DASHBOARD_BIND || envConfig.DASHBOARD_BIND || '127.0.0.1').trim() || '127.0.0.1';
 export const DASHBOARD_TOKEN =
   process.env.DASHBOARD_TOKEN || envConfig.DASHBOARD_TOKEN || '';
 export const DASHBOARD_URL =
   process.env.DASHBOARD_URL || envConfig.DASHBOARD_URL || '';
-export const DASHBOARD_BIND =
-  (process.env.DASHBOARD_BIND || envConfig.DASHBOARD_BIND || '127.0.0.1').trim() || '127.0.0.1';
 
 // Database encryption key (SQLCipher). Required for encrypted database access.
 export const DB_ENCRYPTION_KEY =
@@ -179,6 +221,19 @@ export const DB_ENCRYPTION_KEY =
 // Google API key for Gemini (memory extraction + consolidation)
 export const GOOGLE_API_KEY =
   process.env.GOOGLE_API_KEY || envConfig.GOOGLE_API_KEY || '';
+
+// OpenRouter API key — for the native OpenRouter provider engine.
+// Get at https://openrouter.ai/keys. ClaudeClaw uses this only when the
+// active provider is type: 'openrouter'.
+export const OPENROUTER_API_KEY =
+  process.env.OPENROUTER_API_KEY || envConfig.OPENROUTER_API_KEY || '';
+
+// Default OpenRouter model when none is configured/selected. Single source of
+// truth shared by the adapter, the dashboard model list, the setup wizard, and
+// the Sidebar quick-switch. Override via OPENROUTER_MODEL in .env so a new
+// default lands on restart without a code change.
+export const DEFAULT_OPENROUTER_MODEL =
+  process.env.OPENROUTER_MODEL || envConfig.OPENROUTER_MODEL || 'z-ai/glm-4.5-air:free';
 
 // Streaming strategy for progressive Telegram updates.
 // 'global-throttle' (default): edits a placeholder message with streamed text,
@@ -220,11 +275,47 @@ export const SMART_ROUTING_ENABLED =
 export const SMART_ROUTING_CHEAP_MODEL =
   process.env.SMART_ROUTING_CHEAP_MODEL || envConfig.SMART_ROUTING_CHEAP_MODEL || 'claude-haiku-4-5';
 
+// ── Claude model selection ──────────────────────────────────────────
+// The /model opus|sonnet|haiku Telegram shortcuts and the fresh-install
+// default all resolve through these. Defaults track the current Claude
+// lineup; override any of them in .env so a new model release is picked
+// up on the next restart WITHOUT a code change or a new release.
+// Example: CLAUDE_MODEL_OPUS=claude-opus-4-9
+export const CLAUDE_MODEL_OPUS =
+  process.env.CLAUDE_MODEL_OPUS || envConfig.CLAUDE_MODEL_OPUS || 'claude-opus-4-8';
+export const CLAUDE_MODEL_SONNET =
+  process.env.CLAUDE_MODEL_SONNET || envConfig.CLAUDE_MODEL_SONNET || 'claude-sonnet-4-6';
+export const CLAUDE_MODEL_HAIKU =
+  process.env.CLAUDE_MODEL_HAIKU || envConfig.CLAUDE_MODEL_HAIKU || 'claude-haiku-4-5';
+// Default Claude model when no provider/agent model is configured (e.g. fresh installs).
+// Falls back to the Opus alias above so it tracks the same single source of truth.
+export const DEFAULT_CLAUDE_MODEL =
+  process.env.DEFAULT_CLAUDE_MODEL || envConfig.DEFAULT_CLAUDE_MODEL || CLAUDE_MODEL_OPUS;
+
 // Cost footer on every response.
 // compact = model only, verbose = model + tokens, cost = model + $, full = everything
 export type CostFooterMode = 'off' | 'compact' | 'verbose' | 'cost' | 'full';
 export const SHOW_COST_FOOTER: CostFooterMode =
   (process.env.SHOW_COST_FOOTER || envConfig.SHOW_COST_FOOTER || 'compact') as CostFooterMode;
+
+// Memory notifications: send Telegram message when high-importance memories are created.
+// Default: 'on'. Set to 'off', 'false', or '0' to disable.
+export const MEMORY_NOTIFY: boolean = !['off', 'false', '0'].includes(
+  (process.env.MEMORY_NOTIFY || envConfig.MEMORY_NOTIFY || 'on').toLowerCase(),
+);
+
+// Memory recall mode SEED for installs upgrading past PR #96 (per-agent isolation).
+// PR #96 made recall strictly per-agent ('isolated') for everyone — the right default
+// for new installs. An existing multi-agent install that wants the pre-#96 behaviour
+// (recall draws from every agent on the chat) can set MEMORY_RECALL_MODE=shared once in
+// .env and be done, instead of running a sqlite command after every upgrade.
+// This ONLY seeds the default: the live dashboard toggle (/keep-shared, stored in
+// dashboard_settings) always wins when it has been set explicitly. Anything other than
+// 'shared' (including unset) resolves to 'isolated'.
+export const MEMORY_RECALL_MODE_ENV: 'isolated' | 'shared' =
+  (process.env.MEMORY_RECALL_MODE || envConfig.MEMORY_RECALL_MODE || '').toLowerCase() === 'shared'
+    ? 'shared'
+    : 'isolated';
 
 // Daily cost budget in USD. Warns at 80%. Set to 0 to disable (default).
 // Only useful for API/pay-per-use users. Subscription users should leave off.
@@ -256,6 +347,14 @@ export const PROTECTED_ENV_VARS = (
   'ANTHROPIC_API_KEY,CLAUDE_CODE_OAUTH_TOKEN,DB_ENCRYPTION_KEY,TELEGRAM_BOT_TOKEN,SLACK_USER_TOKEN,GROQ_API_KEY,ELEVENLABS_API_KEY,GOOGLE_API_KEY,BREAKOUT_API_KEY,DASHBOARD_TOKEN,TUTOR_BOT_TOKEN,DESIGN_SYSTEM_BOT_TOKEN,LANDING_PAGE_BOT_TOKEN,DESIGN_AUDIT_BOT_TOKEN,VISITOR_INTEL_BOT_TOKEN,ARCHITECT_BOT_TOKEN,DEV_AGENT_BOT_TOKEN,CODE_REVIEWER_BOT_TOKEN,CI_AGENT_BOT_TOKEN,ROB_BOT_TOKEN,PRODUCT_OWNER_BOT_TOKEN,TECH_LEAD_BOT_TOKEN,BREAKOUT_PO_BOT_TOKEN'
 ).split(',').map((s) => s.trim()).filter(Boolean);
 
+// ── Provider Selection (BETA) ───────────────────────────────────────
+// Gates the alternate provider (ACP / OpenCode / Gemini / Codex) UI and
+// runtime. When false, the dashboard hides the provider picker and the
+// engine forces Claude regardless of what's saved in agent.yaml or
+// main-config.json. Existing installs without this var see no change.
+export const ENABLE_ACP =
+  (process.env.ENABLE_ACP || envConfig.ENABLE_ACP || 'false').toLowerCase() === 'true';
+
 // ── War Room (voice meeting via Pipecat WebSocket) ──────────────────
 export const WARROOM_ENABLED =
   (process.env.WARROOM_ENABLED || envConfig.WARROOM_ENABLED || 'false').toLowerCase() === 'true';
@@ -263,4 +362,3 @@ export const WARROOM_PORT = parseInt(
   process.env.WARROOM_PORT || envConfig.WARROOM_PORT || '7860',
   10,
 );
-

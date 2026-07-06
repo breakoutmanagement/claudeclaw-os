@@ -4,8 +4,11 @@ import { streamSSE } from 'hono/streaming';
 import { serve } from '@hono/node-server';
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_BIND, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, PROJECT_ROOT, STORE_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG } from './config.js';
+import { spawnSync } from 'child_process';
+import { AGENT_ID, ALLOWED_CHAT_ID, DASHBOARD_BIND, DASHBOARD_PORT, DASHBOARD_TOKEN, DASHBOARD_URL, ENABLE_ACP, PROJECT_ROOT, STORE_DIR, WARROOM_TMP_DIR, WHATSAPP_ENABLED, SLACK_USER_TOKEN, CONTEXT_LIMIT, agentDefaultModel, CLAUDECLAW_CONFIG, updateAgentProvider } from './config.js';
+import { listEntries as bunkerList, listArchived as bunkerArchivedList, setPinned as bunkerSetPinned, archiveEntry as bunkerArchive, promoteEntry as bunkerPromote, resolveArtifact as bunkerResolveArtifact, verifyArtifact as bunkerVerifyArtifact } from './bunker.js';
 import crypto from 'crypto';
 import {
   getAllScheduledTasks,
@@ -68,7 +71,18 @@ import {
 import { computeNextRun } from './scheduler.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
-import { AGENT_ID_RE, agentExists, listAgentIds, loadAgentConfig, resolveAgentDir, setAgentModel } from './agent-config.js';
+import {
+  AGENT_ID_RE,
+  agentExists,
+  listAgentIds,
+  loadAgentConfig,
+  resolveAgentDir,
+  resolveAgentDisplayName,
+  setAgentModel,
+  setAgentProvider,
+  getMainDescription,
+  setMainDescription,
+} from './agent-config.js';
 import {
   resolveAgentAvatar,
   avatarEtag,
@@ -90,6 +104,17 @@ import {
   suggestBotNames,
   isAgentRunning,
 } from './agent-create.js';
+import {
+  DEFAULT_CLAUDE_MODEL,
+  DEFAULT_CODEX_MODEL,
+  ProviderConfig,
+  getProviderDisplay,
+  checkProviderAvailability,
+  getMainProviderConfig,
+  normalizeProviderConfig,
+  setMainProviderConfig,
+} from './provider.js';
+import { getSelectedProviderConfig } from './active-provider.js';
 import { getMainModelOverride, processMessageFromDashboard } from './bot.js';
 import { getDashboardHtml } from './dashboard-html.js';
 import { getWarRoomHtml } from './warroom-html.js';
@@ -107,11 +132,247 @@ import {
 } from './db.js';
 import { messageQueue } from './message-queue.js';
 import * as killSwitches from './kill-switches.js';
-import { getIngestionQuotaStatus, extractViaClaude } from './memory-ingest.js';
-import { WARROOM_ENABLED, WARROOM_PORT } from './config.js';
+import { getIngestionQuotaStatus, extractViaProvider } from './memory-ingest.js';
+import { WARROOM_ENABLED, WARROOM_PORT, CLAUDE_MODEL_OPUS, CLAUDE_MODEL_SONNET, CLAUDE_MODEL_HAIKU, DEFAULT_OPENROUTER_MODEL } from './config.js';
 import { logger } from './logger.js';
 import { getTelegramConnected, getBotInfo, chatEvents, getIsProcessing, abortActiveQuery, ChatEvent } from './state.js';
 import { killProcess, isProcessAlive, findProcessesByPattern } from './platform.js';
+import { inspectAcpProviderRuntimeOptions, type AcpProviderRuntimeOptions } from './agent-engine/acp-adapter.js';
+
+// Selectable/valid Claude models for the dashboard pickers and the model-set
+// endpoints. The current lineup is derived from the CLAUDE_MODEL_* config
+// constants (see config.ts) so an env-driven model bump is picked up here
+// without editing this file; older pinned IDs stay valid for agents still on
+// them. Deduped so a config value matching a legacy literal isn't listed twice.
+const VALID_CLAUDE_MODELS = Array.from(new Set([
+  CLAUDE_MODEL_OPUS,
+  CLAUDE_MODEL_SONNET,
+  CLAUDE_MODEL_HAIKU,
+  'claude-fable-5',
+  'claude-sonnet-5',
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'claude-sonnet-4-5',
+  'claude-haiku-4-5',
+]));
+
+// Format gate for model ids on the set-model endpoints. The curated list
+// above feeds the dashboard pickers; anything matching this shape is
+// accepted as a custom id — the SDK 404s clearly on first use if the id
+// doesn't exist, which is the real (and always-current) validator. A
+// hard allowlist here went stale on every Anthropic model launch.
+const CLAUDE_MODEL_ID_RE = /^claude-[a-z0-9][a-z0-9.-]*$/;
+
+const CLAUDE_MODEL_LABELS: Record<string, string> = {
+  'claude-fable-5': 'Fable 5',
+  'claude-sonnet-5': 'Sonnet 5',
+  'claude-opus-4-8': 'Opus 4.8',
+  'claude-opus-4-6': 'Opus 4.6',
+  'claude-sonnet-4-6': 'Sonnet 4.6',
+  'claude-sonnet-4-5': 'Sonnet 4.5',
+  'claude-haiku-4-5': 'Haiku 4.5',
+};
+
+const CLAUDE_MODEL_OPTIONS = VALID_CLAUDE_MODELS.map((id) => ({
+  id,
+  label: CLAUDE_MODEL_LABELS[id] ?? id,
+}));
+
+const GEMINI_MODEL_OPTIONS = [
+  { id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro' },
+  { id: 'gemini-3-flash', label: 'Gemini 3 Flash' },
+  { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro' },
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' },
+];
+
+const CODEX_MODEL_OPTIONS = [
+  { id: DEFAULT_CODEX_MODEL, label: 'GPT-5.5' },
+  { id: 'gpt-5.4', label: 'GPT-5.4' },
+  { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
+  { id: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
+  { id: 'gpt-5.2', label: 'GPT-5.2' },
+];
+
+const CUSTOM_ACP_MODEL_OPTIONS = [
+  { id: 'provider-default', label: 'Provider default' },
+];
+
+const CLAUDE_RUNTIME_OPTIONS = [
+  { id: 'fast', label: 'Low / fast' },
+  { id: 'normal', label: 'Medium / normal' },
+  { id: 'deep', label: 'High / deep' },
+  { id: 'max', label: 'Max' },
+];
+
+const CLAUDE_THINKING_OPTIONS = [
+  { id: 'auto', label: 'Auto' },
+  { id: 'off', label: 'Off' },
+  { id: 'on', label: 'On' },
+];
+
+const CODEX_THINKING_FALLBACK_OPTIONS = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+  { id: 'xhigh', label: 'Extra high' },
+];
+
+function fallbackRuntimeOptions(provider: ProviderConfig): AcpProviderRuntimeOptions {
+  if (provider.type === 'codex') {
+    return {
+      provider: provider.type,
+      modeOptions: [],
+      thinkingOptions: CODEX_THINKING_FALLBACK_OPTIONS,
+      rawConfigOptions: [],
+      source: 'fallback',
+    };
+  }
+  return {
+    provider: provider.type,
+    modeOptions: [],
+    thinkingOptions: [
+      { id: 'auto', label: 'Auto' },
+      { id: 'off', label: 'Off' },
+      { id: 'on', label: 'On' },
+    ],
+    rawConfigOptions: [],
+    source: 'fallback',
+  };
+}
+
+function parseProviderArgsQuery(value: string | undefined): string[] | undefined {
+  if (!value?.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) return parsed.filter((item): item is string => typeof item === 'string');
+  } catch { /* fall through to shell-ish split */ }
+  return value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((part) => part.replace(/^["']|["']$/g, '')) ?? [];
+}
+
+function stripAnsi(s: string): string {
+  return s.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+}
+
+function getOpenCodeModels(): Array<{ id: string; label: string }> {
+  const result = spawnSync('opencode', ['models'], { stdio: 'pipe', encoding: 'utf-8', windowsHide: true });
+  if (result.status !== 0) return [];
+  return stripAnsi(result.stdout)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^[a-z0-9._-]+\/[a-z0-9._-]+$/i.test(line))
+    .map((id) => ({ id, label: id }));
+}
+
+// In-memory cache for OpenRouter /models (5-minute TTL). The dashboard hits
+// /api/providers/models on every Settings page load, so we don't want to call
+// OpenRouter for every poll. Cache survives only as long as the process.
+const openRouterModelsCache: { fetchedAt: number; models: Array<{ id: string; label: string }> } = {
+  fetchedAt: 0,
+  models: [],
+};
+const OPENROUTER_MODELS_TTL_MS = 5 * 60 * 1000;
+
+async function fetchOpenRouterModels(): Promise<Array<{ id: string; label: string }>> {
+  const now = Date.now();
+  if (openRouterModelsCache.models.length > 0 && now - openRouterModelsCache.fetchedAt < OPENROUTER_MODELS_TTL_MS) {
+    return openRouterModelsCache.models;
+  }
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/models', {
+      headers: { Accept: 'application/json' },
+      // Keep this short — the dashboard shouldn't block on a slow network.
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return openRouterModelsCache.models; // serve stale on transient failure
+    const data = await res.json() as { data?: Array<{ id?: string; name?: string }> };
+    const models = (data.data ?? [])
+      .map((m) => ({ id: typeof m.id === 'string' ? m.id : '', label: typeof m.id === 'string' ? m.id : '' }))
+      .filter((m) => m.id.length > 0)
+      .sort((a, b) => {
+        // Free tier first for discoverability, then alphabetic.
+        const aFree = a.id.endsWith(':free');
+        const bFree = b.id.endsWith(':free');
+        if (aFree !== bFree) return aFree ? -1 : 1;
+        return a.id.localeCompare(b.id);
+      });
+    openRouterModelsCache.fetchedAt = now;
+    openRouterModelsCache.models = models;
+    return models;
+  } catch {
+    return openRouterModelsCache.models; // serve stale on error
+  }
+}
+
+function getOpenCodeDefaultModel(): string | undefined {
+  const configPath = path.join(os.homedir(), '.config', 'opencode', 'opencode.jsonc');
+  if (!fs.existsSync(configPath)) return undefined;
+  try {
+    const content = fs.readFileSync(configPath, 'utf-8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    const raw = JSON.parse(content) as Record<string, unknown>;
+    return typeof raw.model === 'string' ? raw.model : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Model persisted for main by PATCH /api/agents/main/model (main-config.json).
+// The bot's chat path reads this via agentProvider at startup, but
+// getSelectedProviderConfig() hides it behind the ENABLE_ACP=false gate
+// (returns DEFAULT_PROVIDER with the default model baked in). Read it
+// explicitly so the dashboard shows the model actually in use instead of
+// silently reverting to the default after a restart.
+function persistedMainClaudeModel(): string | undefined {
+  const persisted = getMainProviderConfig();
+  return persisted.type === 'claude' ? persisted.model : undefined;
+}
+
+function getProviderStatus() {
+  // Use getSelectedProviderConfig so the dashboard reflects the EFFECTIVE
+  // runtime engine, not the stored config. When ENABLE_ACP=false, the gate
+  // forces Claude regardless of what's in main-config.json, and the sidebar
+  // should show that truth instead of a stale Gemini/OpenCode label.
+  const provider = getSelectedProviderConfig();
+  const model = provider.type === 'claude'
+    ? (getMainModelOverride() ?? persistedMainClaudeModel() ?? provider.model ?? agentDefaultModel ?? DEFAULT_CLAUDE_MODEL)
+    : provider.type === 'opencode'
+      ? (provider.model ?? getOpenCodeDefaultModel() ?? 'OpenCode default')
+      : provider.type === 'gemini'
+        ? (provider.model ?? 'Gemini CLI default')
+        : provider.type === 'codex'
+          ? (provider.model ?? DEFAULT_CODEX_MODEL)
+      : (provider.model ?? (provider.command ? `${provider.command}${provider.args?.length ? ` ${provider.args.join(' ')}` : ''}` : 'Provider default'));
+
+  return {
+    provider,
+    providerType: provider.type,
+    label: provider.type === 'claude'
+      ? 'Claude'
+      : provider.type === 'opencode'
+        ? 'OpenCode'
+        : provider.type === 'gemini'
+          ? 'Gemini'
+          : provider.type === 'codex'
+            ? 'Codex'
+            : provider.type === 'openrouter'
+              ? 'OpenRouter'
+              : 'ACP',
+    runtime: getProviderDisplay(provider),
+    model,
+    // Surfaced so the dashboard can hide the provider picker when the
+    // beta ACP feature is off. Single source of truth for the UI.
+    acpEnabled: ENABLE_ACP,
+  };
+}
+
+function validateProviderConfig(provider: ProviderConfig): string | null {
+  if (provider.type === 'acp' && !provider.command?.trim()) {
+    return 'Custom ACP provider requires a command';
+  }
+  return null;
+}
 
 async function classifyTaskAgent(prompt: string): Promise<string | null> {
   const agentIds = listAgentIds();
@@ -132,15 +393,14 @@ Task: "${prompt.slice(0, 500)}"
 
 Reply with JSON: {"agent": "agent_id"}`;
 
-  // Primary path: Claude Haiku via OAuth — same auth the agents use, no
-  // free-tier quota wall. Gemini classification used to 429 here and
-  // surface a 500 to the dashboard, blocking the auto-assign UI.
+  // Primary path: selected provider via the agent engine. Gemini fallback
+  // can hit 429 and surface a 500, blocking the auto-assign UI.
   try {
-    const raw = await extractViaClaude(classificationPrompt);
+    const raw = await extractViaProvider(classificationPrompt);
     const parsed = parseJsonResponse<{ agent: string }>(raw);
     if (parsed?.agent && validAgents.includes(parsed.agent)) return parsed.agent;
   } catch (err) {
-    logger.warn({ err: err instanceof Error ? err.message : err }, 'Haiku classify failed, falling back to Gemini');
+    logger.warn({ err: err instanceof Error ? err.message : err }, 'selected-provider classify failed, falling back to Gemini');
   }
 
   // Fallback: Gemini. Wrapped so a 429 doesn't bubble up — we'd rather
@@ -303,6 +563,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const path = new URL(c.req.url).pathname;
     // Only gate the API surface. Static and HTML pass through.
     if (!path.startsWith('/api/')) {
+      await next();
+      return;
+    }
+    // Bunker artifact files carry their OWN per-slug scoped capability
+    // (?t=&exp=, verified in the handler), so they must NOT require the master
+    // token — that's the whole point of not shipping the master token inside
+    // artifact URLs. Everything else under /api/ still requires it.
+    if (path.startsWith('/api/bunker-files/')) {
       await next();
       return;
     }
@@ -603,6 +871,68 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // unified resolver in avatars.ts.
 
   // War Room API: meeting state management.
+  // ── Bunker (ad-hoc report surface) ─────────────────────────────
+  // Drop an HTML artifact into ~/.claudeclaw/bunker/<slug>/ (helper:
+  // scripts/bunker-add.mjs) and it appears here, served from the
+  // dashboard origin — no throwaway localhost ports to hunt down. Gated by
+  // the /api token middleware; mutations respect the kill-switch.
+  app.get('/api/bunker', (c) => {
+    // DASHBOARD_TOKEN keys the per-entry scoped artifact capabilities.
+    return c.json({ entries: bunkerList(DASHBOARD_TOKEN), archived: bunkerArchivedList(DASHBOARD_TOKEN) });
+  });
+
+  app.post('/api/bunker/:slug/pin', async (c) => {
+    const body: { pinned?: boolean } = await c.req.json().catch(() => ({}));
+    if (!bunkerSetPinned(c.req.param('slug'), body.pinned !== false)) {
+      return c.json({ error: 'Bunker entry not found' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.post('/api/bunker/:slug/archive', (c) => {
+    if (!bunkerArchive(c.req.param('slug'))) {
+      return c.json({ error: 'Bunker entry not found' }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  // Promote: copy the artifact into the vault as a searchable markdown note.
+  app.post('/api/bunker/:slug/promote', (c) => {
+    const result = bunkerPromote(c.req.param('slug'));
+    if (!result) return c.json({ error: 'Bunker entry not found' }, 404);
+    return c.json({ ok: true, vaultPath: result.vaultPath });
+  });
+
+  // Serve the artifact files themselves. NOT gated by the master /api token
+  // (exempted above); instead each request must carry a per-slug scoped
+  // capability (?t=&exp=) minted by the list endpoint. Opened in a NEW TAB —
+  // the global X-Frame-Options: DENY header makes inline framing impossible.
+  app.get('/api/bunker-files/*', (c) => {
+    const pathname = new URL(c.req.url).pathname;
+    const sub = pathname.replace(/^\/api\/bunker-files\//, '');
+
+    // Bind the capability to the slug: first path segment after an optional
+    // _archive/ prefix. Mirrors resolveArtifact's prefix handling so a token
+    // signed for slug A cannot read slug B (or _archive/A vs A).
+    let slugPath = sub.replace(/^\/+/, '');
+    if (slugPath === '_archive' || slugPath.startsWith('_archive/')) {
+      slugPath = slugPath.slice('_archive'.length).replace(/^\/+/, '');
+    }
+    const slug = decodeURIComponent(slugPath.split('/')[0] ?? '');
+
+    const t = c.req.query('t') ?? '';
+    const exp = Number(c.req.query('exp'));
+    if (!bunkerVerifyArtifact(slug, exp, t, DASHBOARD_TOKEN)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    const file = bunkerResolveArtifact(sub);
+    if (!file) return c.text('', 404);
+    return new Response(new Uint8Array(file.data), {
+      headers: { 'Content-Type': file.contentType },
+    });
+  });
+
   // We deliberately do NOT return a ws_url here. Older versions of this
   // route sent `ws://localhost:${WARROOM_PORT}`, which broke any
   // Cloudflare-tunneled access since the browser would try to connect to
@@ -681,11 +1011,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const ids = ['main', ...listAgentIds().filter((id) => id !== 'main')];
     const agents = ids.map((id) => {
       try {
-        if (id === 'main') return { id: 'main', name: 'Main', description: 'General ops and triage' };
         const cfg = loadAgentConfig(id);
-        return { id, name: cfg.name || id, description: cfg.description || '' };
+        return { id, name: cfg.name || resolveAgentDisplayName(id), description: cfg.description || '' };
       } catch {
-        return { id, name: id, description: '' };
+        return { id, name: resolveAgentDisplayName(id), description: '' };
       }
     });
     return c.json({ agents });
@@ -723,11 +1052,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   });
 
   // ── War Room pin: route all voice utterances to a specific agent ──
-  // Lives in /tmp so the Python Pipecat server (a separate process) can
-  // read the state without needing an IPC bus. router.py checks this
-  // file's mtime and reloads only when it changes. Spoken agent prefixes
-  // (e.g. "research, find X") still take precedence over the pin.
-  const WARROOM_PIN_PATH = '/tmp/warroom-pin.json';
+  // Lives in store/tmp (WARROOM_TMP_DIR) so the Python Pipecat server (a
+  // separate process) can read the state without needing an IPC bus. router.py
+  // checks this file's mtime and reloads only when it changes. Spoken agent
+  // prefixes (e.g. "research, find X") still take precedence over the pin.
+  const WARROOM_PIN_PATH = path.join(WARROOM_TMP_DIR, 'warroom-pin.json');
   const VALID_PIN_MODES = new Set(['direct', 'auto']);
   // Recompute on every call so newly-created agents become pinnable
   // without a dashboard restart. listAgentIds() reads the agent-configs
@@ -791,6 +1120,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     }
 
     try {
+      fs.mkdirSync(WARROOM_TMP_DIR, { recursive: true });
       fs.writeFileSync(
         WARROOM_PIN_PATH,
         JSON.stringify({ agent: nextAgent, mode: nextMode, pinnedAt: Date.now() }),
@@ -870,7 +1200,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     return c.json({ ok: true, meetingId: id, autoEnded: stale });
   });
 
-  // Pre-warm the Claude Agent SDK path so the first user turn feels snappy.
+  // Pre-warm the selected provider path so the first user turn feels snappy.
   // The client calls this on page load in parallel with the intro animation.
   // Idempotent + fast: if warmup already ran, returns immediately.
   app.post('/api/warroom/text/warmup', async (c) => {
@@ -1382,6 +1712,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       }
       return {
         agent,
+        display_name: resolveAgentDisplayName(agent),
         gemini_voice: geminiVoice,
         voice_id: entry.voice_id || '',
         name: entry.name || '',
@@ -1684,6 +2015,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       cwd: PROJECT_ROOT,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
 
     let stdout = '';
@@ -1830,7 +2162,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         turns = summary.turns;
         compactions = summary.compactions;
         const contextTokens = (summary.lastContextTokens || 0) + (summary.lastCacheRead || 0);
-        contextPct = contextTokens > 0 ? Math.round((contextTokens / CONTEXT_LIMIT) * 100) : 0;
+        // Size the gauge against the model's real window when the SDK reported
+        // one (e.g. Opus 4.8 = 1M, Sonnet 4.6 = 200k); fall back to CONTEXT_LIMIT.
+        const contextLimit = summary.lastContextWindow || CONTEXT_LIMIT;
+        contextPct = contextTokens > 0 ? Math.round((contextTokens / contextLimit) * 100) : 0;
         const ageSec = Math.floor(Date.now() / 1000) - summary.firstTurnAt;
         if (ageSec < 3600) sessionAge = Math.floor(ageSec / 60) + 'm';
         else if (ageSec < 86400) sessionAge = Math.floor(ageSec / 3600) + 'h';
@@ -1854,7 +2189,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       turns,
       compactions,
       sessionAge,
-      model: agentDefaultModel || 'sonnet-4-6',
+      ...getProviderStatus(),
       telegramConnected: getTelegramConnected(),
       waConnected: WHATSAPP_ENABLED,
       slackConnected: !!SLACK_USER_TOKEN,
@@ -1874,6 +2209,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       // generating long-term memories with no visible signal.
       memoryIngestion: getIngestionQuotaStatus(),
     });
+  });
+
+  app.get('/api/provider/status', (c) => {
+    return c.json(getProviderStatus());
   });
 
   // Token / cost stats
@@ -1902,11 +2241,13 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   // List all configured agents with status
   app.get('/api/agents', (c) => {
     const agentIds = listAgentIds();
+    const hasMain = agentIds.includes('main');
     const agents = agentIds.map((id) => {
       try {
         const config = loadAgentConfig(id);
-        // Check if agent process is alive via PID file
-        const pidFile = path.join(STORE_DIR, `agent-${id}.pid`);
+        // Check if agent process is alive via PID file.
+        // Main agent uses 'claudeclaw.pid'; others use 'agent-<id>.pid'.
+        const pidFile = path.join(STORE_DIR, id === 'main' ? 'claudeclaw.pid' : `agent-${id}.pid`);
         let running = false;
         if (fs.existsSync(pidFile)) {
           try {
@@ -1916,38 +2257,70 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         }
         const stats = getAgentTokenStats(id);
         const mainOverride = id === 'main' ? getMainModelOverride() : undefined;
+        // For main, prefer the model persisted in main-config.json over the
+        // ENABLE_ACP-gated default from getSelectedProviderConfig() — the
+        // persisted value is what the bot actually runs after a restart, and
+        // the gated default silently shadowed dashboard model changes.
+        const mainPersistedModel = id === 'main' ? persistedMainClaudeModel() : undefined;
+        const provider = id === 'main' ? getSelectedProviderConfig() : config.provider;
+        const model = provider.type === 'claude'
+          ? (mainOverride ?? mainPersistedModel ?? provider.model ?? config.model ?? DEFAULT_CLAUDE_MODEL)
+          : provider.model;
+        // Report the effective model inside provider too so the dashboard
+        // picker highlights the right entry.
+        const reportedProvider = provider.type === 'claude' && model ? { ...provider, model } : provider;
         return {
           id,
-          name: config.name,
-          description: config.description,
-          model: mainOverride ?? config.model ?? 'claude-opus-4-6',
+          name: config.name || resolveAgentDisplayName(id),
+          description: id === 'main' ? getMainDescription() : config.description,
+          model,
+          provider: reportedProvider,
           running,
           todayTurns: stats.todayTurns,
           todayCost: stats.todayCost,
-          // Cache-bust token for <img> URLs across all surfaces. Derived
-          // from filesystem mtime+size of the resolved avatar — changes
-          // the moment a user upload or Telegram fetch lands.
           avatar_etag: avatarEtagForId(id),
         };
       } catch {
-        return { id, name: id, description: '', model: 'unknown', running: false, todayTurns: 0, todayCost: 0, avatar_etag: avatarEtagForId(id) };
+        const fallbackName = resolveAgentDisplayName(id);
+        return { id, name: fallbackName, description: '', model: 'unknown', provider: { type: 'opencode' }, running: false, todayTurns: 0, todayCost: 0, avatar_etag: avatarEtagForId(id) };
       }
     });
 
-    // Include main bot too
-    const mainPidFile = path.join(STORE_DIR, 'claudeclaw.pid');
-    let mainRunning = false;
-    if (fs.existsSync(mainPidFile)) {
-      try {
-        const pid = parseInt(fs.readFileSync(mainPidFile, 'utf-8').trim(), 10);
-        mainRunning = isProcessAlive(pid);
-      } catch { /* not running */ }
+    // Ensure main is always first and never duplicated.
+    let allAgents;
+    if (hasMain) {
+      // main exists in agentIds — move it to the front
+      allAgents = [
+        ...agents.filter((a) => a.id === 'main'),
+        ...agents.filter((a) => a.id !== 'main'),
+      ];
+    } else {
+      // No agents/main/agent.yaml — build a main entry from env/defaults
+      const mainPidFile = path.join(STORE_DIR, 'claudeclaw.pid');
+      let mainRunning = false;
+      if (fs.existsSync(mainPidFile)) {
+        try {
+          const pid = parseInt(fs.readFileSync(mainPidFile, 'utf-8').trim(), 10);
+          mainRunning = isProcessAlive(pid);
+        } catch { /* not running */ }
+      }
+      const mainStats = getAgentTokenStats('main');
+      const mainProvider = getMainProviderConfig();
+      allAgents = [
+        {
+          id: 'main',
+          name: resolveAgentDisplayName('main'),
+          description: getMainDescription(),
+          model: getProviderStatus().model,
+          provider: mainProvider,
+          running: mainRunning,
+          todayTurns: mainStats.todayTurns,
+          todayCost: mainStats.todayCost,
+          avatar_etag: avatarEtagForId('main'),
+        },
+        ...agents,
+      ];
     }
-    const mainStats = getAgentTokenStats('main');
-    const allAgents = [
-      { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: getMainModelOverride() ?? 'claude-opus-4-6', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost, avatar_etag: avatarEtagForId('main') },
-      ...agents,
-    ];
 
     return c.json({ agents: allAgents });
   });
@@ -1985,21 +2358,22 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
-    if (!validModels.includes(model)) return c.json({ error: `Invalid model` }, 400);
+    if (!CLAUDE_MODEL_ID_RE.test(model)) {
+      return c.json({ error: `Invalid model id format. Expected e.g. claude-opus-4-8 (known: ${VALID_CLAUDE_MODELS.join(', ')})` }, 400);
+    }
 
     const agentIds = listAgentIds();
     const updated: string[] = [];
     const restartRequired: string[] = [];
     for (const id of agentIds) {
       try {
-        setAgentModel(id, model);
+        setAgentProvider(id, { type: 'claude', model });
         updated.push(id);
-        // Yaml is now updated, but a sub-agent's already-running process
-        // froze its model at startup. Flag for the UI to offer a restart.
         if (id !== 'main') restartRequired.push(id);
       } catch {}
     }
+    setMainProviderConfig({ type: 'claude', model });
+    updated.unshift('main');
     return c.json({ ok: true, model, updated, restartRequired });
   });
 
@@ -2010,14 +2384,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const model = body?.model?.trim();
     if (!model) return c.json({ error: 'model required' }, 400);
 
-    const validModels = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
-    if (!validModels.includes(model)) return c.json({ error: `Invalid model. Valid: ${validModels.join(', ')}` }, 400);
+    if (!CLAUDE_MODEL_ID_RE.test(model)) {
+      return c.json({ error: `Invalid model id format. Expected e.g. claude-opus-4-8 (known: ${VALID_CLAUDE_MODELS.join(', ')})` }, 400);
+    }
 
     try {
       if (agentId === 'main') {
         // Main applies in-memory immediately — no restart needed.
         const { setMainModelOverride } = await import('./bot.js');
         setMainModelOverride(model);
+        setMainProviderConfig({ type: 'claude', model });
         return c.json({ ok: true, agent: agentId, model, restartRequired: false });
       }
       // Sub-agents read agentDefaultModel into config.ts module state once
@@ -2025,10 +2401,190 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       // process restarts. We don't auto-restart because that would kill any
       // in-flight mission task or Telegram turn — surface the requirement
       // so the UI can prompt deliberately.
-      setAgentModel(agentId, model);
+      setAgentProvider(agentId, { type: 'claude', model });
       return c.json({ ok: true, agent: agentId, model, restartRequired: true });
     } catch (err) {
       return c.json({ error: 'Failed to update model' }, 500);
+    }
+  });
+
+  app.get('/api/providers/models', async (c) => {
+    const provider = (c.req.query('provider') || '').toLowerCase();
+    const current = getMainProviderConfig();
+    if (!ENABLE_ACP && provider !== 'claude') {
+      return c.json({ error: 'Provider selection is disabled. Set ENABLE_ACP=true in .env to enable (beta).' }, 403);
+    }
+    if (provider === 'claude') {
+      return c.json({
+        provider,
+        models: CLAUDE_MODEL_OPTIONS,
+        defaultModel: current.type === 'claude' ? (current.model ?? DEFAULT_CLAUDE_MODEL) : DEFAULT_CLAUDE_MODEL,
+        selectable: true,
+        allowCustom: true,
+      });
+    }
+    if (provider === 'opencode') {
+      const models = getOpenCodeModels();
+      const configuredModel = getOpenCodeDefaultModel();
+      const currentModel = current.type === 'opencode' ? current.model : undefined;
+      return c.json({
+        provider,
+        models: models.length ? models : [{ id: 'opencode-default', label: 'OpenCode default' }],
+        defaultModel: currentModel ?? (configuredModel && models.some((m) => m.id === configuredModel)
+          ? configuredModel
+          : models[0]?.id ?? configuredModel ?? 'opencode-default'),
+        selectable: models.length > 0,
+        allowCustom: true,
+        note: 'OpenCode model selection is sent through ACP session/set_model when the provider supports it.',
+      });
+    }
+    if (provider === 'gemini') {
+      return c.json({
+        provider,
+        models: GEMINI_MODEL_OPTIONS,
+        defaultModel: current.type === 'gemini' ? (current.model ?? GEMINI_MODEL_OPTIONS[0].id) : GEMINI_MODEL_OPTIONS[0].id,
+        selectable: true,
+        allowCustom: true,
+        note: 'Gemini model selection is sent through ACP session/set_model when supported.',
+      });
+    }
+    if (provider === 'codex') {
+      return c.json({
+        provider,
+        models: CODEX_MODEL_OPTIONS,
+        defaultModel: current.type === 'codex' ? (current.model ?? DEFAULT_CODEX_MODEL) : DEFAULT_CODEX_MODEL,
+        selectable: true,
+        allowCustom: true,
+        note: 'Codex model selection is sent through the codex-acp adapter via ACP session/set_model when supported.',
+      });
+    }
+    if (provider === 'acp') {
+      return c.json({
+        provider,
+        models: CUSTOM_ACP_MODEL_OPTIONS,
+        defaultModel: current.type === 'acp' ? (current.model ?? 'provider-default') : 'provider-default',
+        selectable: true,
+        allowCustom: true,
+        note: 'Custom ACP model ids are provider-specific. Use provider-default to skip session/set_model.',
+      });
+    }
+    if (provider === 'openrouter') {
+      const models = await fetchOpenRouterModels();
+      const fallback = [{ id: DEFAULT_OPENROUTER_MODEL, label: DEFAULT_OPENROUTER_MODEL }];
+      const list = models.length > 0 ? models : fallback;
+      const currentModel = current.type === 'openrouter' ? current.model : undefined;
+      const defaultModel = currentModel && list.some((m) => m.id === currentModel)
+        ? currentModel
+        : list[0]?.id ?? DEFAULT_OPENROUTER_MODEL;
+      return c.json({
+        provider,
+        models: list,
+        defaultModel,
+        selectable: true,
+        allowCustom: true,
+        note: 'Single-turn chat only — each message is an independent exchange with no prior-turn context (memory injection still applies). Free models (suffix :free) rotate and may be upstream-rate-limited; if one hangs or 429s, try another.',
+      });
+    }
+    return c.json({ error: 'Invalid provider' }, 400);
+  });
+
+  app.get('/api/providers/runtime-options', async (c) => {
+    const providerType = (c.req.query('provider') || '').toLowerCase();
+    if (!ENABLE_ACP && providerType !== 'claude') {
+      return c.json({ error: 'Provider selection is disabled. Set ENABLE_ACP=true in .env to enable (beta).' }, 403);
+    }
+    const current = getMainProviderConfig();
+    const hasCommandOverride = c.req.query('command') !== undefined || c.req.query('args') !== undefined;
+    const base: ProviderConfig = providerType === current.type && !hasCommandOverride
+      ? current
+      : normalizeProviderConfig({
+        type: providerType,
+        command: c.req.query('command'),
+        args: parseProviderArgsQuery(c.req.query('args')),
+      });
+
+    if (base.type === 'claude') {
+      return c.json({
+        provider: base.type,
+        modeOptions: CLAUDE_RUNTIME_OPTIONS,
+        thinkingOptions: CLAUDE_THINKING_OPTIONS,
+        rawConfigOptions: [],
+        source: 'static',
+      });
+    }
+    if (base.type === 'openrouter') {
+      // OpenRouter is a plain OpenAI-compatible HTTP gateway — no ACP-style
+      // session/configuration. No mode/thinking dropdowns to surface.
+      return c.json({
+        provider: base.type,
+        modeOptions: [],
+        thinkingOptions: [],
+        rawConfigOptions: [],
+        source: 'static',
+      });
+    }
+    if (base.type !== 'opencode' && base.type !== 'gemini' && base.type !== 'codex' && base.type !== 'acp') {
+      return c.json({ error: 'Invalid provider' }, 400);
+    }
+    if (base.type === 'acp' && !base.command?.trim()) {
+      return c.json({ ...fallbackRuntimeOptions(base), error: 'Custom ACP provider requires a command' });
+    }
+
+    try {
+      const inspected = await inspectAcpProviderRuntimeOptions(base, PROJECT_ROOT, 5000);
+      if (inspected.modeOptions.length || inspected.thinkingOptions.length) return c.json(inspected);
+      return c.json({
+        ...fallbackRuntimeOptions(base),
+        error: 'Provider did not advertise runtime options',
+      });
+    } catch (err) {
+      const fallback = fallbackRuntimeOptions(base);
+      return c.json({
+        ...fallback,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  app.patch('/api/agents/:id/provider', async (c) => {
+    const agentId = c.req.param('id');
+    const body = await c.req.json<{ provider?: ProviderConfig; type?: string; model?: string; command?: string; args?: string[] }>();
+    const candidate = body.provider ?? {
+      type: body.type,
+      model: body.model,
+      command: body.command,
+      args: body.args,
+    };
+    const provider = normalizeProviderConfig(candidate);
+    if (!ENABLE_ACP && provider.type !== 'claude') {
+      return c.json({ error: 'Provider selection is disabled. Set ENABLE_ACP=true in .env to enable (beta).' }, 403);
+    }
+    const validationError = validateProviderConfig(provider);
+    if (validationError) return c.json({ error: validationError }, 400);
+
+    // Preflight: if the provider's CLI is not installed, fail fast with an
+    // actionable response so the user can install it before the next chat
+    // turn crashes with a spawn ENOENT they can't easily decode.
+    const availability = checkProviderAvailability(provider);
+    if (!availability.ok) {
+      return c.json({
+        error: availability.error,
+        installCommand: availability.installCommand,
+        setupHint: availability.setupHint,
+        docsUrl: availability.docsUrl,
+      }, 400);
+    }
+
+    try {
+      if (agentId === 'main') {
+        setMainProviderConfig(provider);
+        updateAgentProvider(provider);
+      } else {
+        setAgentProvider(agentId, provider);
+      }
+      return c.json({ ok: true, agent: agentId, provider, restartRequired: agentId !== 'main' });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : 'Failed to update provider' }, 500);
     }
   });
 
@@ -2347,7 +2903,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
 
   // ── Agent split suggestions ─────────────────────────────────────────
   // Scans hive_mind for the last 200 actions per agent, sends the bag
-  // (agent description + their recent action summaries) to Haiku, and
+  // (agent description + their recent action summaries) to the selected provider, and
   // asks "is any one agent doing several distinct domains that warrant
   // a split?" Suggestions land in agent_suggestions and surface as a
   // lightbulb badge on the AgentCard. The user can dismiss (= "no
@@ -2374,10 +2930,9 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         .filter((s) => s.length > 0);
       // Sample evenly across the agent's last 200 entries, picking 12
       // representative summaries. We want diversity (different domains,
-      // not just the latest cluster) without bloating the prompt past
-      // Haiku's comfort zone — total prompt with 6 agents × 12
-      // summaries × ~80 chars stays under ~2 KB and typically completes
-      // in 15–25s.
+      // not just the latest cluster) without bloating the prompt — total
+      // prompt with 6 agents × 12 summaries × ~80 chars stays under ~2 KB
+      // and typically completes in 15–25s.
       const target = 12;
       const recentSummaries = allFiltered.length <= target
         ? allFiltered
@@ -2385,8 +2940,9 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       agentMeta.push({ id, description, rawCount: allFiltered.length, recentSummaries });
     }
 
-    // Skip agents with too little signal — splitting an agent that's
-    // done 5 things isn't useful, and Haiku will hallucinate splits.
+    // Skip agents with too little signal — splitting an agent that's done
+    // 5 things isn't useful, and small classifier prompts can hallucinate
+    // splits.
     const eligible = agentMeta.filter((a) => a.rawCount >= 20);
     if (eligible.length === 0) {
       return c.json({ ok: true, suggestions: [], reason: 'not enough hive_mind activity to analyze' });
@@ -2437,11 +2993,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       // ingest, scheduler). Cold-starts under load have measured up to
       // 90s in practice, vs 4–5s for a standalone CLI call with the
       // same prompt size. Better to wait than fail spuriously.
-      raw = await extractViaClaude(promptStr, 120_000);
-      logger.info({ elapsedMs: Date.now() - t0, responseBytes: raw.length }, 'agent suggestion: Haiku replied');
+      raw = await extractViaProvider(promptStr, 120_000);
+      logger.info({ elapsedMs: Date.now() - t0, responseBytes: raw.length }, 'agent suggestion: selected provider replied');
     } catch (err) {
       logger.warn({ err: err instanceof Error ? err.message : err, elapsedMs: Date.now() - t0 }, 'agent suggestion analysis failed');
-      return c.json({ error: 'analysis failed (Haiku unavailable)' }, 503);
+      return c.json({ error: 'analysis failed (selected provider unavailable)' }, 503);
     }
     const parsed = parseJsonResponse<{ suggestions: any[] }>(raw);
     const list = Array.isArray(parsed?.suggestions) ? parsed!.suggestions : [];
@@ -2529,6 +3085,7 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       name?: string;
       description?: string;
       model?: string;
+      provider?: ProviderConfig;
       template?: string;
       botToken?: string;
     }>();
@@ -2544,11 +3101,29 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     if (!botToken) return c.json({ error: 'botToken required' }, 400);
 
     try {
+      const provider = body?.provider ? normalizeProviderConfig(body.provider, body?.model?.trim() || undefined) : undefined;
+      if (provider) {
+        if (!ENABLE_ACP && provider.type !== 'claude') {
+          return c.json({ error: 'Provider selection is disabled. Set ENABLE_ACP=true in .env to enable (beta).' }, 403);
+        }
+        const validationError = validateProviderConfig(provider);
+        if (validationError) return c.json({ error: validationError }, 400);
+        const availability = checkProviderAvailability(provider);
+        if (!availability.ok) {
+          return c.json({
+            error: availability.error,
+            installCommand: availability.installCommand,
+            setupHint: availability.setupHint,
+            docsUrl: availability.docsUrl,
+          }, 400);
+        }
+      }
       const result = await createAgent({
         id,
         name,
         description,
         model: body?.model?.trim() || undefined,
+        provider,
         template: body?.template?.trim() || undefined,
         botToken,
       });
@@ -3016,7 +3591,7 @@ export function startDashboard(botApi?: Api<RawApi>): void {
   // dashboard-token leak away from full mutation access. Operators who
   // want Cloudflare-tunneled or LAN access opt in via DASHBOARD_BIND in
   // .env (e.g. `DASHBOARD_BIND=0.0.0.0`).
-  const bindHost = DASHBOARD_BIND;
+  const bindHost = (DASHBOARD_BIND || '127.0.0.1').trim() || '127.0.0.1';
   if (bindHost !== '127.0.0.1' && bindHost !== 'localhost') {
     logger.warn(
       { bindHost, port: DASHBOARD_PORT },

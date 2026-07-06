@@ -200,8 +200,11 @@ const WARROOM_ENABLED = warroomEnabled;
       <div class="model-picker" onclick="toggleModelPicker(this)" style="display:inline-block">
         <span class="model-current" style="color:#6b7280">Set all <span style="font-size:8px;opacity:0.5">&#9662;</span></span>
         <div class="model-menu" style="display:none;right:0;left:auto">
-          <div class="model-opt" data-model="claude-opus-4-6" onclick="pickGlobalModel(this)">All Opus</div>
-          <div class="model-opt" data-model="claude-sonnet-4-6" onclick="pickGlobalModel(this)">All Sonnet</div>
+          <div class="model-opt" data-model="claude-fable-5" onclick="pickGlobalModel(this)">All Fable 5</div>
+          <div class="model-opt" data-model="claude-sonnet-5" onclick="pickGlobalModel(this)">All Sonnet 5</div>
+          <div class="model-opt" data-model="claude-opus-4-8" onclick="pickGlobalModel(this)">All Opus 4.8</div>
+          <div class="model-opt" data-model="claude-opus-4-6" onclick="pickGlobalModel(this)">All Opus 4.6</div>
+          <div class="model-opt" data-model="claude-sonnet-4-6" onclick="pickGlobalModel(this)">All Sonnet 4.6</div>
           <div class="model-opt" data-model="claude-haiku-4-5" onclick="pickGlobalModel(this)">All Haiku</div>
         </div>
       </div>
@@ -224,7 +227,7 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
     <div>
       <div style="font-size:14px;font-weight:600;color:#a5b4fc">War Room Voices</div>
-      <div style="font-size:11px;color:#6b7280;margin-top:2px">Per-agent Gemini Live voice config. Main keeps Charon unless you change it.</div>
+      <div style="font-size:11px;color:#6b7280;margin-top:2px">Per-agent Gemini Live voice config. The primary agent defaults to Charon.</div>
     </div>
     <div style="display:flex;gap:8px">
       <button id="voicesSaveBtn" onclick="saveVoices()" disabled style="background:#374151;color:#9ca3af;border:none;border-radius:6px;padding:5px 12px;font-size:12px;font-weight:600;cursor:not-allowed">Save</button>
@@ -255,7 +258,7 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="meet-agent-select" style="background:#0a0a0a;color:#fff;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;font-size:12px;min-width:110px">
-        <option value="main">Main</option>
+        <option value="main">Loading...</option>
       </select>
       <input type="text" id="meet-url-input" placeholder="Paste Meet URL, or leave empty to auto-read clipboard"
         style="flex:1;min-width:220px;background:#0a0a0a;color:#fff;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;font-size:12px;font-family:ui-monospace,monospace">
@@ -276,7 +279,7 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <select id="meet-daily-agent-select" style="background:#0a0a0a;color:#fff;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;font-size:12px;min-width:110px">
-        <option value="main">Main</option>
+        <option value="main">Loading...</option>
       </select>
       <select id="meet-daily-mode-select" style="background:#0a0a0a;color:#fff;border:1px solid #2a2a2a;border-radius:6px;padding:6px 10px;font-size:12px;min-width:100px">
         <option value="direct">Direct</option>
@@ -389,7 +392,15 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
       <label class="text-xs text-gray-400 block mb-1">Description</label>
       <input type="text" id="caw-desc" placeholder="What this agent does" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 12px;color:#e0e0e0;font-size:13px;outline:none;margin-bottom:8px;box-sizing:border-box" maxlength="200">
 
-      <div class="flex gap-2 mb-3">
+      <div class="flex gap-2 mb-2">
+        <div style="flex:1">
+          <label class="text-xs text-gray-400 block mb-1">Provider</label>
+          <select id="caw-provider" onchange="cawProviderChanged()" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
+            <option value="opencode">OpenCode</option>
+            <option value="claude">Claude</option>
+            <option value="acp">ACP</option>
+          </select>
+        </div>
         <div style="flex:1">
           <label class="text-xs text-gray-400 block mb-1">Model</label>
           <select id="caw-model" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
@@ -398,12 +409,12 @@ ${WARROOM_ENABLED ? `<div class="card" style="border:1px solid #1e3a5f">
             <option value="claude-haiku-4-5">Haiku 4.5</option>
           </select>
         </div>
-        <div style="flex:1">
-          <label class="text-xs text-gray-400 block mb-1">Template</label>
-          <select id="caw-template" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
-            <option value="_template">Blank</option>
-          </select>
-        </div>
+      </div>
+      <div class="mb-3">
+        <label class="text-xs text-gray-400 block mb-1">Template</label>
+        <select id="caw-template" style="width:100%;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 10px;color:#e0e0e0;font-size:12px;outline:none">
+          <option value="_template">Blank</option>
+        </select>
       </div>
 
       <div id="caw-step1-error" class="text-red-400 text-xs mb-2" style="display:none"></div>
@@ -628,6 +639,15 @@ const TOKEN = ${JSON.stringify(token)};
 const CHAT_ID = ${JSON.stringify(chatId)};
 const BASE = location.origin;
 
+// ── Agent display name resolution ────────────────────────────────────
+// Populated by loadAgents(). Used everywhere instead of raw agent IDs.
+const agentNameMap = {};
+
+function resolveAgentName(agentId) {
+  if (agentNameMap[agentId]) return agentNameMap[agentId];
+  return agentId.charAt(0).toUpperCase() + agentId.slice(1);
+}
+
 // Device detection
 function detectDevice() {
   const ua = navigator.userAgent;
@@ -845,7 +865,7 @@ async function loadTasks() {
     }
     c.innerHTML = data.tasks.map(t => {
       const statusCls = t.status === 'running' ? 'pill-running' : t.status === 'active' ? 'pill-active' : 'pill-paused';
-      const agentBadge = t.agent_id && t.agent_id !== 'main' ? '<span class="text-xs text-gray-500 ml-2">[' + t.agent_id + ']</span>' : '';
+      const agentBadge = t.agent_id && t.agent_id !== 'main' ? '<span class="text-xs text-gray-500 ml-2">[' + resolveAgentName(t.agent_id) + ']</span>' : '';
       const lastStatusIcon = t.last_status === 'success' ? '<span class="last-success" title="Last run succeeded">&#10003;</span> ' : t.last_status === 'failed' ? '<span class="last-failed" title="Last run failed">&#10007;</span> ' : t.last_status === 'timeout' ? '<span class="last-timeout" title="Last run timed out">&#9200;</span> ' : '';
       const lastResult = t.last_result ? '<details class="mt-2"><summary class="text-xs text-gray-500">' + lastStatusIcon + 'Last result</summary><pre class="text-xs text-gray-400 mt-1 whitespace-pre-wrap break-words">' + escapeHtml(t.last_result) + '</pre></details>' : '';
       const runningInfo = t.status === 'running' && t.started_at ? '<span class="text-xs text-blue-400 ml-2">running for ' + elapsed(t.started_at) + '</span>' : '';
@@ -1083,7 +1103,7 @@ function renderVoices() {
       : '';
     return (
       '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(255,255,255,0.02);border:1px solid ' + borderColor + ';border-radius:6px">' +
-        '<div style="width:80px;font-size:12px;font-weight:600;color:#d1d5db;text-transform:uppercase;letter-spacing:0.5px">' + r.agent + defaultBadge + dirtyBadge + '</div>' +
+        '<div style="width:80px;font-size:12px;font-weight:600;color:#d1d5db;text-transform:uppercase;letter-spacing:0.5px">' + (r.display_name || resolveAgentName(r.agent)) + defaultBadge + dirtyBadge + '</div>' +
         '<select data-agent="' + r.agent + '" onchange="onVoiceChange(this)" style="flex:1;max-width:280px;background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:4px;padding:4px 8px;font-size:12px;font-family:inherit">' + opts + '</select>' +
         '<div style="flex:1;min-width:0;font-size:10px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + (r.name || '') + '</div>' +
       '</div>'
@@ -1223,12 +1243,13 @@ async function loadMeetAgentOptions() {
     }
     const sorted = ['main', ...[...ids].filter(function(x){ return x !== 'main'; }).sort()];
     const optionsHtml = sorted.map(function(id) {
-      const label = id.charAt(0).toUpperCase() + id.slice(1);
-      return '<option value="' + id + '">' + label + '</option>';
+      const a = data.agents && data.agents.find(function(ag) { return ag.id === id; });
+      const label = (a && a.name) || resolveAgentName(id);
+      return '<option value="' + id + '">' + escapeHtml(label) + '</option>';
     }).join('');
     if (selAvatar) selAvatar.innerHTML = optionsHtml;
     if (selDaily) selDaily.innerHTML = optionsHtml;
-  } catch (e) { /* keep the default "Main" only option */ }
+  } catch (e) { /* keep the loading placeholder */ }
 }
 
 async function sendAgentToMeet() {
@@ -1450,7 +1471,7 @@ async function refreshMeetSessions() {
       meta.style.cssText = 'min-width:0;flex:1';
       const title = document.createElement('div');
       title.style.cssText = 'font-size:12px;color:#fff;font-weight:600';
-      const agentLabel = (s.agent_id || '').charAt(0).toUpperCase() + (s.agent_id || '').slice(1);
+      const agentLabel = resolveAgentName(s.agent_id || 'main');
       title.textContent = agentLabel + ' · ' + (s.status === 'live' ? 'live' : s.status);
       const sub = document.createElement('div');
       sub.style.cssText = 'font-size:10px;color:#6b7280;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
@@ -1487,6 +1508,12 @@ async function loadAgents() {
     const container = document.getElementById('agents-container');
     // Always show agents section so "+ New Agent" button is accessible
     section.style.display = '';
+    // Populate agentNameMap from API response
+    if (data.agents) {
+      for (const a of data.agents) {
+        if (a && a.id && a.name) agentNameMap[a.id] = a.name;
+      }
+    }
     if (!data.agents || data.agents.length <= 1) {
       container.innerHTML = '<div class="text-xs text-gray-600 py-2">No agents yet. Click + New Agent to create one.</div>';
       return;
@@ -1495,14 +1522,19 @@ async function loadAgents() {
       const color = AGENT_COLORS[a.id] || '#6b7280';
       const dot = a.running ? '<span style="color:#6ee7b7">\u25CF</span>' : '<span style="color:#666">\u25CB</span>';
       const statusText = a.running ? 'live' : 'off';
-      const modelOpts = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
-      const modelShort = function(m) { return {'claude-opus-4-6':'Opus','claude-sonnet-4-6':'Sonnet','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku'}[m] || m; };
-      const currentModel = a.model || (a.id === 'main' ? 'claude-opus-4-6' : 'claude-sonnet-4-6');
+      const modelOpts = ['claude-fable-5', 'claude-sonnet-5', 'claude-opus-4-8', 'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-sonnet-4-5', 'claude-haiku-4-5'];
+      const modelShort = function(m) { return {'claude-fable-5':'Fable 5','claude-sonnet-5':'Sonnet 5','claude-opus-4-8':'Opus 4.8','claude-opus-4-6':'Opus 4.6','claude-sonnet-4-6':'Sonnet 4.6','claude-sonnet-4-5':'Sonnet 4.5','claude-haiku-4-5':'Haiku'}[m] || m; };
+      const currentModel = a.model || (a.id === 'main' ? 'claude-opus-4-8' : 'claude-sonnet-4-6');
       const modelLabel = modelShort(currentModel);
+      const providerType = (a.provider && a.provider.type) || 'opencode';
+      const providerLabel = providerType === 'claude' ? 'Claude: ' + modelLabel : providerType === 'opencode' ? 'OpenCode' : 'ACP';
       const modelSelect = '<div class="model-picker" data-agent="' + a.id + '" onclick="event.stopPropagation();toggleModelPicker(this)">' +
-        '<span class="model-current">' + modelLabel + ' <span style="font-size:8px;opacity:0.5">&#9662;</span></span>' +
+        '<span class="model-current">' + providerLabel + ' <span style="font-size:8px;opacity:0.5">&#9662;</span></span>' +
         '<div class="model-menu" style="display:none">' +
+          '<div class="model-opt' + (providerType === 'opencode' ? ' model-active' : '') + '" data-provider="opencode" onclick="pickProvider(this)">OpenCode default</div>' +
+          '<div class="model-opt' + (providerType === 'acp' ? ' model-active' : '') + '" data-provider="acp" onclick="pickProvider(this)">ACP default</div>' +
           modelOpts.map(m => '<div class="model-opt' + (currentModel === m ? ' model-active' : '') + '" data-model="' + m + '" onclick="pickModel(this)">' + modelShort(m) + '</div>').join('') +
+          '<div class="model-opt' + (modelOpts.indexOf(currentModel) === -1 && providerType === 'claude' ? ' model-active' : '') + '" onclick="pickCustomModel(this)">Custom…</div>' +
         '</div>' +
       '</div>';
       // Unified avatar endpoint: serves user uploads, Telegram-cached
@@ -1542,27 +1574,78 @@ async function pickModel(optEl) {
   var picker = optEl.closest('.model-picker');
   var agentId = picker.dataset.agent;
   picker.querySelector('.model-menu').style.display = 'none';
+  await setAgentModelReq(agentId, model);
+}
+
+async function pickCustomModel(optEl) {
+  var picker = optEl.closest('.model-picker');
+  var agentId = picker.dataset.agent;
+  picker.querySelector('.model-menu').style.display = 'none';
+  var model = window.prompt('Model id (e.g. claude-fable-5):');
+  if (!model || !model.trim()) return;
+  await setAgentModelReq(agentId, model.trim());
+}
+
+// Shared PATCH helper — surfaces server rejections (e.g. bad model id
+// format) instead of silently swallowing the 400.
+async function setAgentModelReq(agentId, model) {
   try {
-    await fetch(BASE + '/api/agents/' + agentId + '/model?token=' + TOKEN, {
+    var res = await fetch(BASE + '/api/agents/' + agentId + '/model?token=' + TOKEN, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: model }),
     });
+    if (!res.ok) {
+      var err = {};
+      try { err = await res.json(); } catch(_) {}
+      alert('Model update failed: ' + (err.error || ('HTTP ' + res.status)));
+      return;
+    }
+    var data = await res.json();
+    if (data.restartRequired) {
+      alert('Model set to ' + model + '. Restart agent "' + agentId + '" for it to take effect.');
+    }
     await loadAgents();
-  } catch(e) { console.error('Model update failed:', e); }
+  } catch(e) { console.error('Model update failed:', e); alert('Model update failed: ' + e); }
+}
+
+async function pickProvider(optEl) {
+  var provider = optEl.dataset.provider;
+  var picker = optEl.closest('.model-picker');
+  var agentId = picker.dataset.agent;
+  picker.querySelector('.model-menu').style.display = 'none';
+  try {
+    await fetch(BASE + '/api/agents/' + agentId + '/provider?token=' + TOKEN, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: { type: provider } }),
+    });
+    await loadAgents();
+    await loadMissionControl();
+  } catch(e) { console.error('Provider update failed:', e); }
 }
 
 async function pickGlobalModel(optEl) {
   var model = optEl.dataset.model;
   optEl.closest('.model-menu').style.display = 'none';
   try {
-    await fetch(BASE + '/api/agents/model?token=' + TOKEN, {
+    var res = await fetch(BASE + '/api/agents/model?token=' + TOKEN, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: model }),
     });
+    if (!res.ok) {
+      var err = {};
+      try { err = await res.json(); } catch(_) {}
+      alert('Global model update failed: ' + (err.error || ('HTTP ' + res.status)));
+      return;
+    }
+    var data = await res.json();
+    if (data.restartRequired && data.restartRequired.length) {
+      alert('Model set to ' + model + '. Restart required for: ' + data.restartRequired.join(', '));
+    }
     await loadAgents();
-  } catch(e) { console.error('Global model update failed:', e); }
+  } catch(e) { console.error('Global model update failed:', e); alert('Global model update failed: ' + e); }
 }
 
 // Close model menus when clicking outside
@@ -1732,6 +1815,56 @@ let cawCreatedId = null;
 let cawIdDebounce = null;
 let cawTokenDebounce = null;
 let cawNameManuallyEdited = false;
+const CAW_FALLBACK_MODELS = {
+  claude: [
+    { id: 'claude-fable-5', label: 'Fable 5' },
+    { id: 'claude-sonnet-5', label: 'Sonnet 5' },
+    { id: 'claude-opus-4-8', label: 'Opus 4.8' },
+    { id: 'claude-opus-4-6', label: 'Opus 4.6' },
+    { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
+    { id: 'claude-sonnet-4-5', label: 'Sonnet 4.5' },
+    { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
+  ],
+  opencode: [{ id: 'opencode-default', label: 'OpenCode default' }],
+  acp: [{ id: 'provider-default', label: 'Provider default' }],
+};
+
+function cawSetModelOptions(models, selected, disabled) {
+  var sel = document.getElementById('caw-model');
+  sel.innerHTML = '';
+  models.forEach(function(m) {
+    var opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.label || m.id;
+    sel.appendChild(opt);
+  });
+  if (selected && models.some(function(m) { return m.id === selected; })) sel.value = selected;
+  sel.disabled = !!disabled;
+  sel.style.opacity = disabled ? '0.65' : '1';
+}
+
+async function cawLoadModels(provider, selected) {
+  var fallback = CAW_FALLBACK_MODELS[provider] || CAW_FALLBACK_MODELS.opencode;
+  cawSetModelOptions(fallback, selected, provider !== 'claude' && provider !== 'opencode');
+  try {
+    var data = await api('/api/providers/models?provider=' + encodeURIComponent(provider));
+    var models = data.models && data.models.length ? data.models : fallback;
+    cawSetModelOptions(models, selected || data.defaultModel, data.selectable === false);
+  } catch(e) {
+    console.error('Provider model load error:', e);
+  }
+}
+
+function cawProviderChanged() {
+  var provider = document.getElementById('caw-provider').value;
+  cawLoadModels(provider, null);
+}
+
+function cawSelectedProviderPayload() {
+  var provider = document.getElementById('caw-provider').value;
+  if (provider === 'claude') return { type: 'claude', model: document.getElementById('caw-model').value };
+  return { type: provider };
+}
 
 function openCreateAgentWizard() {
   cawStep = 1;
@@ -1743,7 +1876,8 @@ function openCreateAgentWizard() {
   document.getElementById('caw-id').value = '';
   document.getElementById('caw-name').value = '';
   document.getElementById('caw-desc').value = '';
-  document.getElementById('caw-model').value = 'claude-sonnet-4-6';
+  document.getElementById('caw-provider').value = 'opencode';
+  cawSetModelOptions(CAW_FALLBACK_MODELS.opencode, 'opencode-default', false);
   document.getElementById('caw-token').value = '';
   document.getElementById('caw-id-status').innerHTML = '';
   document.getElementById('caw-token-status').innerHTML = '';
@@ -1751,6 +1885,7 @@ function openCreateAgentWizard() {
   document.getElementById('caw-step1-error').style.display = 'none';
   document.getElementById('caw-step2-error').style.display = 'none';
   cawShowStep(1);
+  cawLoadModels('opencode', null);
   loadCawTemplates();
   var o = document.getElementById('create-agent-overlay');
   var m = document.getElementById('create-agent-modal');
@@ -1924,6 +2059,7 @@ async function cawCreate() {
         name: document.getElementById('caw-name').value.trim(),
         description: document.getElementById('caw-desc').value.trim(),
         model: document.getElementById('caw-model').value,
+        provider: cawSelectedProviderPayload(),
         template: document.getElementById('caw-template').value,
         botToken: document.getElementById('caw-token').value.trim(),
       }),
@@ -2019,7 +2155,7 @@ async function loadHiveMind() {
       const blurClass = isBlurred ? 'privacy-blur' : '';
       return '<tr>' +
         '<td class="col-time">' + time + '</td>' +
-        '<td class="col-agent" style="color:' + color + '">' + e.agent_id + '</td>' +
+        '<td class="col-agent" style="color:' + color + '">' + resolveAgentName(e.agent_id) + '</td>' +
         '<td class="col-action">' + escapeHtml(e.action) + '</td>' +
         '<td><div class="col-summary ' + blurClass + '" data-section="hive" data-idx="' + i + '" onclick="toggleItemBlur(this)">' + escapeHtml(e.summary) + '</div></td>' +
       '</tr>';
@@ -2469,6 +2605,7 @@ refreshAll();
 let chatOpen = false;
 let chatSSE = null;
 let chatHistoryLoaded = false;
+let chatSSEReconnecting = false;
 let unreadCount = 0;
 let chatAgents = [];
 let activeAgentTab = 'all';
@@ -2518,7 +2655,7 @@ async function loadAgentTabs() {
       const dot = document.createElement('span');
       dot.className = 'agent-dot ' + (a.running ? 'live' : 'dead');
       tab.appendChild(dot);
-      tab.appendChild(document.createTextNode(a.id.charAt(0).toUpperCase() + a.id.slice(1)));
+      tab.appendChild(document.createTextNode(a.name || resolveAgentName(a.id)));
       tab.onclick = function() { switchAgentTab(a.id, this); };
       container.appendChild(tab);
     });
@@ -2620,12 +2757,25 @@ function connectChatSSE() {
   chatSSE.addEventListener('ping', function() { /* keepalive */ });
 
   chatSSE.onerror = function() {
-    // Auto-reconnect handled by EventSource
+    // EventSource auto-reconnects. Mark that we dropped so the next onopen
+    // knows it's a reconnect (not the initial connect) and can backfill any
+    // messages exchanged while we were disconnected.
     updateChatStatus(false);
-    setTimeout(() => updateChatStatus(true), 3000);
+    chatSSEReconnecting = true;
   };
 
-  chatSSE.onopen = function() { updateChatStatus(true); };
+  chatSSE.onopen = function() {
+    updateChatStatus(true);
+    if (chatSSEReconnecting) {
+      // We just reconnected after a drop. Messages sent during the gap were
+      // never streamed, so the panel has a silent hole. Force a history
+      // refresh: reload now if the panel is open, otherwise invalidate so the
+      // next openChat() re-fetches.
+      chatSSEReconnecting = false;
+      chatHistoryLoaded = false;
+      if (chatOpen) loadChatHistory();
+    }
+  };
 }
 
 function updateChatStatus(connected) {

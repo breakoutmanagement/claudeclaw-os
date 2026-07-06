@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { DB_ENCRYPTION_KEY, STORE_DIR } from './config.js';
+import { DB_ENCRYPTION_KEY, MEMORY_RECALL_MODE_ENV, STORE_DIR } from './config.js';
 import { cosineSimilarity } from './embeddings.js';
 import { logger } from './logger.js';
 import { MEMORY_POLICY } from './memory-policy.js';
@@ -169,6 +169,7 @@ function createSchema(database: Database.Database): void {
       output_tokens   INTEGER NOT NULL DEFAULT 0,
       cache_read      INTEGER NOT NULL DEFAULT 0,
       context_tokens  INTEGER NOT NULL DEFAULT 0,
+      context_window  INTEGER,
       cost_usd        REAL NOT NULL DEFAULT 0,
       did_compact     INTEGER NOT NULL DEFAULT 0,
       created_at      INTEGER NOT NULL
@@ -426,6 +427,7 @@ export function initDatabase(): void {
   db.pragma('busy_timeout = 5000');
   createSchema(db);
   runMigrations(db);
+  stampMemoryIsolationMigration(db);
 
   // Restrict database file permissions (owner-only read/write)
   try {
@@ -466,6 +468,13 @@ function runMigrations(database: Database.Database): void {
   const hasContextTokens = cols.some((c) => c.name === 'context_tokens');
   if (!hasContextTokens) {
     database.exec(`ALTER TABLE token_usage ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0`);
+  }
+  // Add context_window column (the model's real window, e.g. Opus 4.8 = 1M).
+  // Nullable: NULL on old rows / engines that don't report one, so consumers
+  // fall back to CONTEXT_LIMIT.
+  const hasContextWindow = cols.some((c) => c.name === 'context_window');
+  if (!hasContextWindow) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN context_window INTEGER`);
   }
 
   // Multi-agent: migrate sessions table to composite primary key (chat_id, agent_id)
@@ -511,6 +520,9 @@ function runMigrations(database: Database.Database): void {
   }
   if (!taskColNames.includes('last_status')) {
     database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN last_status TEXT`);
+  }
+  if (!taskColNames.includes('acceptance_check')) {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN acceptance_check TEXT`);
   }
 
   // ── Memory V2 migration ──────────────────────────────────────────────
@@ -670,6 +682,16 @@ function runMigrations(database: Database.Database): void {
     logger.info('Migration: added pinned column to memories table');
   }
 
+  // Memory isolation (#95): explicit shared tier. Memory recall is scoped to
+  // the requesting agent plus rows flagged shared = 1. Existing rows default to
+  // 0 (strict per-agent) so the cross-agent Hive Mind recall leak is closed
+  // without retroactively sharing anyone's memories. Promote a memory to the
+  // shared tier explicitly to make it visible to every agent on the chat.
+  if (!memColsPost.some((c: { name: string }) => c.name === 'shared')) {
+    database.exec(`ALTER TABLE memories ADD COLUMN shared INTEGER NOT NULL DEFAULT 0`);
+    logger.info('Migration: added shared column to memories table');
+  }
+
   // Mission Control: migrate assigned_agent from NOT NULL to nullable (allow unassigned tasks)
   const missionCols = database.prepare(`PRAGMA table_info(mission_tasks)`).all() as Array<{ name: string; notnull: number }>;
   const assignedCol = missionCols.find((c) => c.name === 'assigned_agent');
@@ -789,6 +811,7 @@ export interface Memory {
   salience: number;
   consolidated: number;
   pinned: number;      // 1 = permanent, never decays
+  shared: number;      // 1 = visible to every agent on the chat (shared tier); 0 = strict per-agent recall
   embedding: string | null; // JSON array of floats
   created_at: number;
   accessed_at: number;
@@ -915,7 +938,7 @@ export function searchMemories(
   // the worst case, interpret attacker-controlled characters as query
   // operators. Belt-and-braces on top of extractKeywords' own filtering.
   const ftsQuery = keywords.map((w) => `"${w.replace(/"/g, '')}"*`).join(' OR ');
-  const ftsAgentClause = agentId ? ' AND memories.agent_id = ?' : '';
+  const ftsAgentClause = agentId ? ' AND (memories.agent_id = ? OR memories.shared = 1)' : '';
   const ftsParams: unknown[] = [ftsQuery, chatId];
   if (agentId) ftsParams.push(agentId);
   ftsParams.push(limit);
@@ -941,7 +964,7 @@ export function searchMemories(
     likeParams.push(pattern, pattern, pattern, pattern);
   }
 
-  const likeAgentClause = agentId ? ' AND agent_id = ?' : '';
+  const likeAgentClause = agentId ? ' AND (agent_id = ? OR shared = 1)' : '';
   const likeAllParams: unknown[] = [chatId, ...likeParams];
   if (agentId) likeAllParams.push(agentId);
   likeAllParams.push(limit);
@@ -991,7 +1014,7 @@ export function getMemoriesWithEmbeddings(
   agentId?: string,
 ): Array<{ id: number; embedding: number[]; summary: string; importance: number; topics: string[] }> {
   const sql = agentId
-    ? 'SELECT id, embedding, summary, importance, topics FROM memories WHERE chat_id = ? AND agent_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL'
+    ? 'SELECT id, embedding, summary, importance, topics FROM memories WHERE chat_id = ? AND (agent_id = ? OR shared = 1) AND embedding IS NOT NULL AND superseded_by IS NULL'
     : 'SELECT id, embedding, summary, importance, topics FROM memories WHERE chat_id = ? AND embedding IS NOT NULL AND superseded_by IS NULL';
   const params = agentId ? [chatId, agentId] : [chatId];
   const rows = db
@@ -1014,7 +1037,7 @@ export function getRecentHighImportanceMemories(
   if (agentId) {
     return db
       .prepare(
-        `SELECT * FROM memories WHERE chat_id = ? AND agent_id = ? AND importance >= 0.5
+        `SELECT * FROM memories WHERE chat_id = ? AND (agent_id = ? OR shared = 1) AND importance >= 0.5
          ORDER BY accessed_at DESC LIMIT ?`,
       )
       .all(chatId, agentId, limit) as Memory[];
@@ -1027,7 +1050,20 @@ export function getRecentHighImportanceMemories(
     .all(chatId, limit) as Memory[];
 }
 
-export function getRecentMemories(chatId: string, limit = 5): Memory[] {
+export function getRecentMemories(chatId: string, limit = 5, agentId?: string): Memory[] {
+  // Memory isolation (#95/#96): when an agentId is given, scope the dump to that
+  // agent's own memories plus the explicit shared tier (shared = 1). This mirrors
+  // the recall path (searchMemories / getRecentHighImportanceMemories) so the
+  // /memory command reflects per-agent context when agents share a chat_id.
+  // Omitting agentId keeps the all-agents behaviour for back-compat.
+  if (agentId) {
+    return db
+      .prepare(
+        `SELECT * FROM memories WHERE chat_id = ? AND (agent_id = ? OR shared = 1)
+         ORDER BY accessed_at DESC LIMIT ?`,
+      )
+      .all(chatId, agentId, limit) as Memory[];
+  }
   return db
     .prepare(
       'SELECT * FROM memories WHERE chat_id = ? ORDER BY accessed_at DESC LIMIT ?',
@@ -1101,6 +1137,12 @@ export function pinMemory(memoryId: number): void {
 
 export function unpinMemory(memoryId: number): void {
   db.prepare('UPDATE memories SET pinned = 0 WHERE id = ?').run(memoryId);
+}
+
+/** Promote a memory to the shared tier (visible to every agent on the chat),
+ *  or demote it back to strict per-agent recall. See memory isolation (#95). */
+export function setMemoryShared(memoryId: number, shared: boolean): void {
+  db.prepare('UPDATE memories SET shared = ? WHERE id = ?').run(shared ? 1 : 0, memoryId);
 }
 
 // ── Consolidation CRUD ──────────────────────────────────────────────
@@ -1236,6 +1278,7 @@ export interface ScheduledTask {
   agent_id: string;
   started_at: number | null;
   last_status: 'success' | 'failed' | 'timeout' | null;
+  acceptance_check: string | null;
 }
 
 export function createScheduledTask(
@@ -1244,12 +1287,13 @@ export function createScheduledTask(
   schedule: string,
   nextRun: number,
   agentId = 'main',
+  acceptanceCheck: string | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id)
-     VALUES (?, ?, ?, ?, 'active', ?, ?)`,
-  ).run(id, prompt, schedule, nextRun, now, agentId);
+    `INSERT INTO scheduled_tasks (id, prompt, schedule, next_run, status, created_at, agent_id, acceptance_check)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+  ).run(id, prompt, schedule, nextRun, now, agentId, acceptanceCheck);
 }
 
 export function getDueTasks(agentId = 'main'): ScheduledTask[] {
@@ -1733,12 +1777,13 @@ export function saveTokenUsage(
   costUsd: number,
   didCompact: boolean,
   agentId = 'main',
+  contextWindow: number | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, context_window)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, contextWindow);
 }
 
 export interface SessionTokenSummary {
@@ -1747,6 +1792,8 @@ export interface SessionTokenSummary {
   totalOutputTokens: number;
   lastCacheRead: number;
   lastContextTokens: number;
+  /** The active model's real context window from the last turn; null if unknown. */
+  lastContextWindow: number | null;
   totalCostUsd: number;
   compactions: number;
   firstTurnAt: number;
@@ -2073,11 +2120,11 @@ export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | n
   // Falls back to cache_read for backward compat with rows before the migration
   const lastRow = db
     .prepare(
-      `SELECT cache_read, context_tokens FROM token_usage
+      `SELECT cache_read, context_tokens, context_window FROM token_usage
        WHERE session_id = ?
        ORDER BY created_at DESC LIMIT 1`,
     )
-    .get(sessionId) as { cache_read: number; context_tokens: number } | undefined;
+    .get(sessionId) as { cache_read: number; context_tokens: number; context_window: number | null } | undefined;
 
   return {
     turns: row.turns,
@@ -2085,6 +2132,7 @@ export function getSessionTokenUsage(sessionId: string): SessionTokenSummary | n
     totalOutputTokens: row.totalOutputTokens,
     lastCacheRead: lastRow?.cache_read ?? 0,
     lastContextTokens: lastRow?.context_tokens ?? lastRow?.cache_read ?? 0,
+    lastContextWindow: lastRow?.context_window ?? null,
     totalCostUsd: row.totalCostUsd,
     compactions: row.compactions,
     firstTurnAt: row.firstTurnAt,
@@ -2913,6 +2961,113 @@ export function getAllDashboardSettings(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const row of rows) out[row.key] = row.value;
   return out;
+}
+
+// ── Memory recall mode (#96 follow-up) ──────────────────────────────
+// PR #96 made recall strictly per-agent (isolated) for everyone. This is the
+// correct default and what new installs get. Existing multi-agent installs can
+// opt back into the pre-#96 behaviour — recall draws from every agent on the
+// chat — via /keep-shared. Stored in dashboard_settings so it survives restarts
+// and is shared across all agent processes pointing at the same store.
+//
+// Precedence: an explicit dashboard_settings row (the live /keep-shared toggle)
+// always wins. When no row has been set, fall back to the MEMORY_RECALL_MODE env
+// seed (config.ts) so an upgrading install can preserve old behaviour with one
+// .env line instead of a post-upgrade sqlite command. Absent both, default to
+// 'isolated'.
+export type MemoryRecallMode = 'isolated' | 'shared';
+const MEMORY_RECALL_MODE_KEY = 'memory_recall_mode';
+const MEMORY_MIGRATION_NOTICE_KEY = 'memory_migration_notice';
+const MEMORY_ISOLATION_STAMPED_KEY = 'memory_isolation_migrated';
+
+export function getMemoryRecallMode(): MemoryRecallMode {
+  const stored = getDashboardSetting(MEMORY_RECALL_MODE_KEY);
+  if (stored === 'shared') return 'shared';
+  if (stored === 'isolated') return 'isolated';
+  // No explicit dashboard toggle yet — fall back to the env seed (default 'isolated').
+  return MEMORY_RECALL_MODE_ENV;
+}
+
+export function setMemoryRecallMode(mode: MemoryRecallMode): void {
+  setDashboardSetting(MEMORY_RECALL_MODE_KEY, mode);
+}
+
+/** Notice state for the one-time existing-multi-agent-install heads-up.
+ *  'pending' → the primary agent should surface it; 'sent' → already shown. */
+export function getMemoryMigrationNotice(): 'pending' | 'sent' | null {
+  const v = getDashboardSetting(MEMORY_MIGRATION_NOTICE_KEY);
+  return v === 'pending' || v === 'sent' ? v : null;
+}
+
+export function setMemoryMigrationNotice(state: 'pending' | 'sent'): void {
+  setDashboardSetting(MEMORY_MIGRATION_NOTICE_KEY, state);
+}
+
+/**
+ * One-time detection: did this install exist with MORE THAN ONE agent before
+ * the #96 isolation change landed? Those users had cross-agent shared recall as
+ * their lived-in behaviour, so we flag a notice (surfaced once by the primary
+ * agent) offering /keep-shared. Fresh and single-agent installs are a no-op:
+ * isolation is identical to their prior behaviour, so they get no notice.
+ *
+ * Evaluates exactly once per install. The stamp marker is claimed ATOMICALLY
+ * (INSERT ... ON CONFLICT DO NOTHING): only the single process that actually
+ * inserts it proceeds to evaluate and set the notice. This matters because all
+ * agent processes share one store and start concurrently — a plain
+ * read-then-write check would let a slow agent's stamp run AFTER the primary
+ * has already shown and cleared the notice, rewriting 'pending' back over
+ * 'sent' and re-nagging on the next restart. Losers of the claim bail here and
+ * never touch the notice flag.
+ */
+export function stampMemoryIsolationMigration(database: Database.Database = db): void {
+  const claim = database
+    .prepare(
+      `INSERT INTO dashboard_settings (key, value, updated_at)
+       VALUES (?, '1', strftime('%s','now')) ON CONFLICT(key) DO NOTHING`,
+    )
+    .run(MEMORY_ISOLATION_STAMPED_KEY);
+  if (claim.changes === 0) return; // another process already stamped this install
+
+  const row = database
+    .prepare(`SELECT COUNT(DISTINCT agent_id) AS n FROM memories`)
+    .get() as { n: number };
+  if ((row?.n ?? 0) > 1) {
+    // Existing multi-agent install: flag the one-time heads-up for the primary.
+    database
+      .prepare(
+        `INSERT INTO dashboard_settings (key, value, updated_at) VALUES (?, 'pending', strftime('%s','now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(MEMORY_MIGRATION_NOTICE_KEY);
+  }
+}
+
+/**
+ * Migrate an arbitrary ClaudeClaw database file to the current schema, in place.
+ *
+ * Opens `dbPath` with the same pragmas as initDatabase(), then applies
+ * createSchema (IF NOT EXISTS), runMigrations (idempotent ADD COLUMN) and
+ * stampMemoryIsolationMigration on that handle. Unlike initDatabase() this does
+ * NOT depend on STORE_DIR and does NOT touch the process-wide `db` connection,
+ * so migration tooling can upgrade a snapshot copy without disturbing a running
+ * instance.
+ *
+ * Idempotent: safe to run repeatedly. Memory isolation is preserved — existing
+ * rows keep their `shared` value (new rows default to 0) and nothing is ever
+ * shared retroactively. The file is opened with a fresh connection that is
+ * always closed before returning, even on error.
+ */
+export function migrateDbFile(dbPath: string): void {
+  const database = new Database(dbPath);
+  try {
+    database.pragma('journal_mode = WAL');
+    database.pragma('busy_timeout = 5000');
+    createSchema(database);
+    runMigrations(database);
+    stampMemoryIsolationMigration(database);
+  } finally {
+    database.close();
+  }
 }
 
 // ── Agent file history (versioned backups in SQLite) ────────────────

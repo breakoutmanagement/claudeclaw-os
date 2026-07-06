@@ -1,11 +1,22 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
   _initTestDatabase,
+  migrateDbFile,
   setSession,
   getSession,
   clearSession,
   saveStructuredMemory,
   searchMemories,
+  setMemoryShared,
+  getMemoryRecallMode,
+  setMemoryRecallMode,
+  getMemoryMigrationNotice,
+  setMemoryMigrationNotice,
+  stampMemoryIsolationMigration,
   getRecentMemories,
   getRecentHighImportanceMemories,
   touchMemory,
@@ -126,6 +137,109 @@ describe('database', () => {
       const mems = getRecentHighImportanceMemories('chat1', 10);
       expect(mems).toHaveLength(1);
       expect(mems[0].summary).toBe('high importance');
+    });
+  });
+
+  // Memory isolation (#95): recall scoped by agent_id + explicit shared tier.
+  describe('agent-scoped recall + shared tier', () => {
+    it('searchMemories scoped to an agent excludes other agents memories', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi knows about embroidery', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'main knows about embroidery', [], [], 0.6, 'conversation', 'main');
+      const results = searchMemories('chat1', 'embroidery', 5, undefined, 'naomi');
+      expect(results.length).toBe(1);
+      expect(results[0].agent_id).toBe('naomi');
+    });
+
+    it('searchMemories scoped to an agent still returns shared memories from other agents', () => {
+      const sharedId = saveStructuredMemory('chat1', 'raw', 'dashboard runs on port 3141 widget', [], [], 0.6, 'conversation', 'main');
+      setMemoryShared(sharedId, true);
+      const results = searchMemories('chat1', 'widget', 5, undefined, 'naomi');
+      expect(results.length).toBe(1);
+      expect(results[0].id).toBe(sharedId);
+      expect(results[0].shared).toBe(1);
+    });
+
+    it('searchMemories with no agent scope returns all agents (back-compat)', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi octopus fact', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'main octopus fact', [], [], 0.6, 'conversation', 'main');
+      const results = searchMemories('chat1', 'octopus', 5);
+      expect(results.length).toBe(2);
+    });
+
+    it('getRecentHighImportanceMemories scoped to an agent excludes others but keeps own + shared', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi recent', [], [], 0.8, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'drummer recent', [], [], 0.8, 'conversation', 'drummer');
+      const sharedId = saveStructuredMemory('chat1', 'raw', 'shared recent', [], [], 0.8, 'conversation', 'main');
+      setMemoryShared(sharedId, true);
+      const mems = getRecentHighImportanceMemories('chat1', 10, 'naomi');
+      const summaries = mems.map((m) => m.summary).sort();
+      expect(summaries).toEqual(['naomi recent', 'shared recent']);
+    });
+
+    it('getRecentMemories scoped to an agent excludes others but keeps own + shared', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi dump', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'drummer dump', [], [], 0.6, 'conversation', 'drummer');
+      const sharedId = saveStructuredMemory('chat1', 'raw', 'shared dump', [], [], 0.6, 'conversation', 'main');
+      setMemoryShared(sharedId, true);
+      const mems = getRecentMemories('chat1', 10, 'naomi');
+      const summaries = mems.map((m) => m.summary).sort();
+      expect(summaries).toEqual(['naomi dump', 'shared dump']);
+    });
+
+    it('getRecentMemories with no agent scope returns all agents (back-compat)', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi all', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'drummer all', [], [], 0.6, 'conversation', 'drummer');
+      const mems = getRecentMemories('chat1', 10);
+      expect(mems.length).toBe(2);
+    });
+
+    it('new memories default to not shared (strict per-agent)', () => {
+      const id = saveStructuredMemory('chat1', 'raw', 'private note', [], [], 0.6, 'conversation', 'main');
+      const mem = getRecentMemories('chat1', 1)[0];
+      expect(mem.id).toBe(id);
+      expect(mem.shared).toBe(0);
+    });
+  });
+
+  // #96 follow-up: recall mode + one-time migration notice for existing
+  // multi-agent installs.
+  describe('memory recall mode + isolation migration notice', () => {
+    it('defaults recall mode to isolated', () => {
+      expect(getMemoryRecallMode()).toBe('isolated');
+    });
+
+    it('setMemoryRecallMode round-trips and only accepts known modes', () => {
+      setMemoryRecallMode('shared');
+      expect(getMemoryRecallMode()).toBe('shared');
+      setMemoryRecallMode('isolated');
+      expect(getMemoryRecallMode()).toBe('isolated');
+    });
+
+    it('stamp flags a pending notice for a multi-agent install', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi note', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'main note', [], [], 0.6, 'conversation', 'main');
+      stampMemoryIsolationMigration();
+      expect(getMemoryMigrationNotice()).toBe('pending');
+    });
+
+    it('stamp does NOT flag a single-agent install', () => {
+      saveStructuredMemory('chat1', 'raw', 'only main', [], [], 0.6, 'conversation', 'main');
+      stampMemoryIsolationMigration();
+      expect(getMemoryMigrationNotice()).toBeNull();
+    });
+
+    it('stamp does NOT flag a fresh install with no memories', () => {
+      stampMemoryIsolationMigration();
+      expect(getMemoryMigrationNotice()).toBeNull();
+    });
+
+    it('stamp runs exactly once — a second multi-agent state does not re-flag after dismissal', () => {
+      saveStructuredMemory('chat1', 'raw', 'naomi note', [], [], 0.6, 'conversation', 'naomi');
+      saveStructuredMemory('chat1', 'raw', 'main note', [], [], 0.6, 'conversation', 'main');
+      stampMemoryIsolationMigration();
+      setMemoryMigrationNotice('sent');
+      stampMemoryIsolationMigration();
+      expect(getMemoryMigrationNotice()).toBe('sent');
     });
   });
 
@@ -409,5 +523,89 @@ describe('database', () => {
       expect(timeline[0]).toHaveProperty('date');
       expect(timeline[0]).toHaveProperty('count');
     });
+  });
+});
+
+describe('migrateDbFile', () => {
+  let dir: string;
+  let dbPath: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-db-'));
+    dbPath = path.join(dir, 'legacy.db');
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Build a pre-isolation "legacy" memories table: no `shared` column,
+   *  populated across two agents, plus an unrelated existing table. */
+  function seedLegacyDb(): void {
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE memories (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id     TEXT NOT NULL,
+        agent_id    TEXT NOT NULL,
+        summary     TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+      );
+    `);
+    const insert = legacy.prepare(
+      `INSERT INTO memories (chat_id, agent_id, summary, created_at) VALUES (?, ?, ?, ?)`,
+    );
+    insert.run('chat1', 'rc1', 'rc1 fact', 100);
+    insert.run('chat1', 'rc2', 'rc2 fact', 101);
+    insert.run('chat1', 'rc1', 'rc1 fact 2', 102);
+    legacy.close();
+  }
+
+  it('adds the isolation `shared` column without sharing anything retroactively', () => {
+    seedLegacyDb();
+    migrateDbFile(dbPath);
+
+    const db = new Database(dbPath);
+    const cols = db.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>;
+    expect(cols.some((c) => c.name === 'shared')).toBe(true);
+
+    const shared = db.prepare(`SELECT COUNT(*) AS n FROM memories WHERE shared = 1`).get() as { n: number };
+    expect(shared.n).toBe(0); // strict isolation preserved — nothing shared on migrate
+    db.close();
+  });
+
+  it('preserves existing rows and their data', () => {
+    seedLegacyDb();
+    migrateDbFile(dbPath);
+
+    const db = new Database(dbPath);
+    const count = db.prepare(`SELECT COUNT(*) AS n FROM memories`).get() as { n: number };
+    expect(count.n).toBe(3);
+    const summaries = db.prepare(`SELECT summary FROM memories ORDER BY id`).all() as Array<{ summary: string }>;
+    expect(summaries.map((r) => r.summary)).toEqual(['rc1 fact', 'rc2 fact', 'rc1 fact 2']);
+    db.close();
+  });
+
+  it('is idempotent — a second run is a no-op and does not throw', () => {
+    seedLegacyDb();
+    migrateDbFile(dbPath);
+    expect(() => migrateDbFile(dbPath)).not.toThrow();
+
+    const db = new Database(dbPath);
+    const count = db.prepare(`SELECT COUNT(*) AS n FROM memories`).get() as { n: number };
+    expect(count.n).toBe(3);
+    db.close();
+  });
+
+  it('creates the full schema on an empty database file', () => {
+    migrateDbFile(dbPath); // no seed — fresh file
+    const db = new Database(dbPath);
+    const tables = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type='table'`)
+      .all() as Array<{ name: string }>;
+    const names = tables.map((t) => t.name);
+    expect(names).toContain('memories');
+    expect(names).toContain('dashboard_settings');
+    db.close();
   });
 });

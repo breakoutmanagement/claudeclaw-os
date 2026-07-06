@@ -17,6 +17,7 @@ import { Voices } from '@/pages/Voices';
 import { Chat } from '@/pages/Chat';
 import { WarRoom } from '@/pages/WarRoom';
 import { AgentFiles } from '@/pages/AgentFiles';
+import { Bunker } from '@/pages/Bunker';
 import { DEFAULT_ROUTE } from '@/lib/routes';
 
 export function App() {
@@ -50,6 +51,7 @@ export function App() {
           <Route path="/agents"><Agents /></Route>
           <Route path="/agents/:id/files"><AgentFiles /></Route>
           <Route path="/chat"><Chat /></Route>
+          <Route path="/bunker"><Bunker /></Route>
           <Route path="/memories"><Memories /></Route>
           <Route path="/hive"><HiveMind /></Route>
           <Route path="/usage"><Usage /></Route>
