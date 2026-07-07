@@ -1,0 +1,34 @@
+# claudeclaw-update.conf.example - config for deploy/update.sh + deploy/smoke-all.sh
+#
+# Copy to deploy/claudeclaw-update.conf on the HOST (gitignored - never commit
+# the filled-in copy) and fill in the values for THIS host, then:
+#   CLAUDECLAW_DEPLOY_CONF=deploy/claudeclaw-update.conf bash deploy/update.sh
+#
+# These describe a LIVE multi-agent host running USER systemd units. This is the
+# UPDATE path, not the install path - see deploy/install-vps.sh for greenfield.
+
+# Run user (owns $LIVE_DIR; must equal the user the agent units run as).
+RUN_USER=ccaudit
+
+# Fixed real path the agent units' WorkingDirectory/ExecStart reference.
+LIVE_DIR=/home/ccaudit/claudeclaw-os
+
+# The fork to update from. For a PRIVATE fork, also set REPO_CLONE_TOKEN to a
+# short-lived ghs_/gho_ token (used only for the clone, scrubbed from .git/config).
+REPO_URL=https://github.com/breakoutmanagement/claudeclaw-os.git
+REPO_BRANCH=main
+# REPO_CLONE_TOKEN=
+
+# Agents that run as com.claudeclaw.agent-<name>.service, space separated.
+# tess is handled separately (restarted last, only when idle - live trading).
+AGENTS="main groit-sales grokeroobot rob tedd"
+TESS_UNIT=com.claudeclaw.agent-tess.service
+TESS_TRADING_DIR=/home/ccaudit/claudeclaw-os/agents/tess/trading
+
+# Live state carried from the current dir into the staged clone before the swap.
+STATE_PATHS="store .env agents"
+
+# Marker substring identifying the watchdog crontab line to pause during the swap.
+WATCHDOG_MARKER=watchdog-main.sh
+
+DASHBOARD_PORT=3141

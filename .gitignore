@@ -10,6 +10,11 @@ dist/
 # Bare pattern matches in any directory (incl. repo root) to prevent accidental
 # commits of a file that contains live tokens.
 claudeclaw-deploy.conf
+claudeclaw-update.conf
+# update.sh leftovers - key-bearing swap dirs + backups, must never be committed
+claudeclaw-os-*/
+*.old-*/
+claudeclaw-update-backups/
 # VPS deployment guide — shared with the community, not shipped in the repo (README is enough)
 deploy/docs/
 # Env backups (e.g. rotate-oauth-token.py) — full copies of .env, contain live secrets
