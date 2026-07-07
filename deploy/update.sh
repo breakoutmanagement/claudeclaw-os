@@ -97,6 +97,7 @@ ok "No tess trading subprocess in flight"
 step "Staging fresh clone of $REPO_BRANCH"
 ASKPASS=""
 cleanup_askpass(){ [[ -n "$ASKPASS" && -f "$ASKPASS" ]] && rm -f "$ASKPASS"; ASKPASS=""; return 0; }
+trap 'cleanup_askpass' EXIT   # remove the shim on ANY exit path (kill/die/normal)
 if [[ -n "$REPO_CLONE_TOKEN" && "$REPO_URL" == https://github.com/* ]]; then
   ASKPASS="$(mktemp)"; chmod 700 "$ASKPASS"
   # git calls askpass twice: for Username then Password. Emit token as both-safe.
@@ -180,28 +181,17 @@ ok "DB opens on staged code"
 ( cd "$STAGE_DIR" && npm test >/dev/null 2>&1 ) || die "vitest FAILED in staged tree - NOT swapping. [gate]"
 ok "vitest passed"
 
-# Boot probe: start the entrypoint headless against the carried DB, wait for a
-# readiness signal in the log, then stop it. Timeout-bounded. A boot that never
-# signals ready (or crashes) aborts before the swap.
-step "Boot probe (staged entrypoint against carried DB)"
-BOOT_LOG="$BACKUP_DIR/boot-probe.log"
-(
-  cd "$STAGE_DIR"
-  # BOOT_PROBE=1 tells index.js to exit after reaching ready if it honors it;
-  # regardless, we hard-timeout and kill. We only assert it does not crash on boot
-  # and emits a ready/listening marker.
-  timeout 45 node dist/index.js >"$BOOT_LOG" 2>&1 &
-  bp=$!
-  ready=0
-  for _ in $(seq 1 40); do
-    if grep -qiE 'ready|listening|auth ok|dashboard' "$BOOT_LOG" 2>/dev/null; then ready=1; break; fi
-    if ! kill -0 "$bp" 2>/dev/null; then break; fi   # process died
-    sleep 1
-  done
-  kill "$bp" 2>/dev/null || true; wait "$bp" 2>/dev/null || true
-  [[ "$ready" == "1" ]]
-) || die "Boot probe did not reach ready (see $BOOT_LOG) - staged code won't boot. NOT swapping. [gate]"
-ok "Boot probe reached ready"
+# Entrypoint sanity: the built entrypoint exists and PARSES. We deliberately do
+# NOT execute or import it - dist/index.js calls main() at top level (ESM), so
+# loading it would start the live bot and take real side-effects (Telegram, DB
+# writes) pre-swap. `node --check` parses the file without running it, catching a
+# truncated/corrupt build. Actual boot is proven POST-swap by the agent health
+# check below + smoke-all.sh; a crash-loop there triggers the (now-correct) rollback.
+step "Entrypoint sanity (parse dist/index.js, no execute)"
+[[ -f "$STAGE_DIR/dist/index.js" ]] || die "dist/index.js missing after build. NOT swapping. [gate]"
+node --check "$STAGE_DIR/dist/index.js" 2>/dev/null \
+  || die "dist/index.js does not parse (corrupt build). NOT swapping. [gate]"
+ok "Entrypoint present and parses"
 
 # --- 6. pause the watchdog (prevents split-brain restart of OLD main) --------
 # ABORT A-6: if we can't pause the watchdog it will relaunch OLD main mid-swap
@@ -209,6 +199,7 @@ ok "Boot probe reached ready"
 step "Pausing cron watchdog"
 CRON_BAK="$BACKUP_DIR/crontab.bak"
 crontab -l 2>/dev/null > "$CRON_BAK" || true
+chmod 600 "$CRON_BAK" 2>/dev/null || true
 restore_watchdog(){
   # Idempotent, never fails the caller (used on success path AND in rollback).
   if [[ "${WATCHDOG_PAUSED:-0}" == "1" ]]; then
@@ -260,15 +251,30 @@ for _ in $(seq 1 20); do
 done
 [[ "$active" == "0" ]] || die "agents still active after stop ($active) - NOT swapping. [stop-verify]"
 # DB must have no open writer before the rename (else writes land in OLD_DIR).
-if command -v fuser >/dev/null 2>&1 && [[ -f "$LIVE_DIR/store/claudeclaw.db" ]]; then
-  for _ in $(seq 1 10); do
-    fuser "$LIVE_DIR/store/claudeclaw.db" >/dev/null 2>&1 || break
-    sleep 1
-  done
-  fuser "$LIVE_DIR/store/claudeclaw.db" >/dev/null 2>&1 \
-    && die "store/claudeclaw.db still has an open handle - NOT swapping (split-DB risk). [stop-verify]"
+if [[ -f "$LIVE_DIR/store/claudeclaw.db" ]]; then
+  # Pick an available open-handle checker; the guard must NOT silently no-op.
+  DB_LSOF=""
+  if command -v fuser >/dev/null 2>&1; then DB_LSOF="fuser"
+  elif command -v lsof  >/dev/null 2>&1; then DB_LSOF="lsof"; fi
+  db_has_handle(){ case "$DB_LSOF" in
+      fuser) fuser "$1" >/dev/null 2>&1 ;;
+      lsof)  lsof -- "$1" >/dev/null 2>&1 ;;
+      *) return 2 ;;  # no checker available
+    esac; }
+  if [[ -n "$DB_LSOF" ]]; then
+    for _ in $(seq 1 10); do db_has_handle "$LIVE_DIR/store/claudeclaw.db" || break; sleep 1; done
+    db_has_handle "$LIVE_DIR/store/claudeclaw.db" \
+      && die "store/claudeclaw.db still has an open handle - NOT swapping (split-DB risk). [stop-verify]"
+    ok "DB has no open writer ($DB_LSOF)"
+  else
+    # Neither fuser nor lsof present: the split-DB guard cannot run. Do not pretend
+    # it passed - warn loudly and add a safety pause so writers can drain.
+    warn "neither fuser nor lsof present - cannot verify DB is released. Install psmisc or lsof."
+    warn "applying a 5s drain pause as a weak fallback before the swap."
+    sleep 5
+  fi
 fi
-ok "all units inactive, DB released"
+ok "all units inactive"
 
 step "Swapping $LIVE_DIR <- $STAGE_DIR"
 mv "$LIVE_DIR" "$OLD_DIR"
@@ -278,11 +284,29 @@ ok "swapped (previous kept at $OLD_DIR)"
 
 step "Restarting agents (tess last)"
 systemctl --user start "${UNIT_ARR[@]}"
-sleep 3
-for a in $AGENTS; do
-  systemctl --user is-active --quiet "com.claudeclaw.agent-$a.service" \
-    && ok "agent-$a active" || { warn "agent-$a NOT active"; false; }
+# Bounded health wait: agents cold-start native better-sqlite3, so give them a
+# real window (not a single 3s shot) before declaring failure. A slow-but-fine
+# start must NOT reverse a good swap. Only a genuine failure (a unit still not
+# active after the window) triggers an EXPLICIT rollback - evaluated, not an
+# implicit `false` under errexit.
+health_ok=0
+for _ in $(seq 1 30); do
+  down=0
+  for a in $AGENTS; do
+    systemctl --user is-active --quiet "com.claudeclaw.agent-$a.service" || down=$((down+1))
+  done
+  [[ "$down" == "0" ]] && { health_ok=1; break; }
+  sleep 1
 done
+if [[ "$health_ok" != "1" ]]; then
+  for a in $AGENTS; do
+    systemctl --user is-active --quiet "com.claudeclaw.agent-$a.service" \
+      && ok "agent-$a active" || warn "agent-$a NOT active"
+  done
+  rollback   # explicit: a genuinely-failed restart reverses the swap and restores OLD
+fi
+for a in $AGENTS; do ok "agent-$a active"; done
+
 # tess last, only if still idle
 if pgrep -f "agents/tess/trading/" >/dev/null 2>&1; then
   warn "tess trade started during swap - NOT restarting tess; start when idle: systemctl --user start $TESS_UNIT"
