@@ -11,7 +11,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF="${CLAUDECLAW_DEPLOY_CONF:-$SCRIPT_DIR/claudeclaw-deploy.conf}"
+CONF="${CLAUDECLAW_DEPLOY_CONF:-$SCRIPT_DIR/claudeclaw-update.conf}"
 # shellcheck disable=SC1090
 [[ -f "$CONF" ]] && { set -a; source "$CONF"; set +a; }
 
@@ -32,13 +32,15 @@ chk "tutor process running" "pgrep -f 'index.js --agent tutor'"
 
 echo "== DB read+write on the deployed code =="
 chk "better-sqlite3 opens live DB" "cd '$LIVE_DIR' && node -e \"require('better-sqlite3')(require('path').join(process.cwd(),'store','claudeclaw.db')).prepare('select 1').get()\""
-chk "DB is writable (throwaway table)" "cd '$LIVE_DIR' && node -e \"const d=require('better-sqlite3')(require('path').join(process.cwd(),'store','claudeclaw.db')); d.exec('create table if not exists _smoke_probe(x)'); d.prepare('insert into _smoke_probe values(1)').run(); d.exec('drop table _smoke_probe');\""
+# Write probe inside a transaction that is ALWAYS rolled back - proves the DB
+# accepts a write without persisting anything to the live prod store.
+chk "DB accepts a write (rolled back, no mutation)" "cd '$LIVE_DIR' && node -e \"const d=require('better-sqlite3')(require('path').join(process.cwd(),'store','claudeclaw.db')); d.exec('BEGIN'); d.exec('create table _smoke_probe(x)'); d.prepare('insert into _smoke_probe values(1)').run(); d.exec('ROLLBACK'); process.exit(0)\""
 
 echo "== dashboard =="
 chk "dashboard answers on loopback:$DASHBOARD_PORT" "curl -fsS -o /dev/null -m 5 http://127.0.0.1:$DASHBOARD_PORT/ || curl -fsS -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:$DASHBOARD_PORT/healthz"
 
 echo "== watchdog un-paused =="
-chk "watchdog crontab line active (not PAUSED-BY-UPDATE)" "crontab -l 2>/dev/null | grep '$WATCHDOG_MARKER' | grep -qv 'PAUSED-BY-UPDATE'"
+chk "watchdog crontab line active (not PAUSED-BY-UPDATE)" "crontab -l 2>/dev/null | grep -F '$WATCHDOG_MARKER' | grep -vq '^# PAUSED-BY-UPDATE'"
 
 echo
 if [[ $fail -eq 0 ]]; then echo "${G}SMOKE GREEN: $pass checks passed${Z}"; exit 0

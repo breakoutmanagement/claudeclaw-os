@@ -152,8 +152,10 @@ What it does, in order, with an abort at every destructive step:
    `DB_ENCRYPTION_KEY` hash matches** (else the encrypted DB would be unreadable - abort).
 4. Back up the live DB + `.env` off the swap path.
 5. `npm ci` + build the staged tree.
-6. **Pre-swap gate:** open the carried-over live DB with the staged code's
-   `better-sqlite3` (catches ABI/key mismatch **before** the swap). Run vitest.
+6. **Pre-swap gate (all hard aborts):** (a) open the carried-over live DB with the
+   staged code's `better-sqlite3` (catches ABI/key mismatch), (b) `vitest` must pass,
+   (c) **boot-probe** - start the entrypoint against the carried DB and require it to
+   reach ready - all **before** the swap, so "builds but won't boot" never ships.
 7. **Pause the cron watchdog** (else it relaunches OLD main mid-swap - split-brain).
 8. Stop agents, **rename-swap** the dir (units reference the fixed path, so they pick
    up new code on restart), restart all agents with **tess last / only if idle**,
@@ -173,11 +175,13 @@ The filled-in `claudeclaw-update.conf` is gitignored (may hold a clone token).
 ```bash
 ssh <host>
 cd <LIVE_DIR>
-git fetch origin main
+# update.sh clones $REPO_BRANCH fresh into a dated dir - no manual fetch needed;
+# set REPO_BRANCH in claudeclaw-update.conf to update from a branch other than main.
 CLAUDECLAW_DEPLOY_CONF=deploy/claudeclaw-update.conf bash deploy/update.sh
 bash deploy/smoke-all.sh
 ```
 
-`smoke-all.sh` proves: all agents active, DB read+write on the new code, dashboard
-answers on loopback, watchdog un-paused. Exit 0 = green. After green, remove the
-`.old-<stamp>` dir the update left as the rollback point.
+`smoke-all.sh` proves: all agents active, DB accepts a (rolled-back) write on the
+new code, dashboard answers on loopback, watchdog un-paused. Exit 0 = green. After
+green, **shred/remove the `.old-<stamp>` dir** (it holds a copy of `.env`) and the
+backup once you no longer need the rollback point.
