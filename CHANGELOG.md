@@ -5,6 +5,22 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.4.1] - 2026-07-11
+
+### Bug Fixes
+
+- Auto-fall-back to system claude on non-AVX Intel Macs ([#132](https://github.com/earlyaidopters/claudeclaw-os/pull/132))
+- Capture AskUserQuestion Other reply outside the message queue ([#131](https://github.com/earlyaidopters/claudeclaw-os/pull/131))
+- Copy-fallback for AGENTS.md on symlink-restricted platforms ([#140](https://github.com/earlyaidopters/claudeclaw-os/pull/140))
+- Refresh lockfile and add security overrides ([#139](https://github.com/earlyaidopters/claudeclaw-os/pull/139))
+- Remove root AGENTS.md symlink orphaned by #64 ([#138](https://github.com/earlyaidopters/claudeclaw-os/pull/138))
+- Route claude CLI off the unrunnable SDK binary on NixOS
+- Write vite manualChunks in function form for rolldown compatibility ([#137](https://github.com/earlyaidopters/claudeclaw-os/pull/137))
+
+### Documentation
+
+- Add respin-session, token-cost observability, and agent-identity RFCs ([#133](https://github.com/earlyaidopters/claudeclaw-os/pull/133))
+
 ## [1.4.0] - 2026-07-03
 
 ### Bug Fixes
