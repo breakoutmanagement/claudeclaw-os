@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { setMainProviderConfig, type ProviderConfig, type ProviderType } from '../src/provider.js';
 
 import { getVenvPython, getVenvPip } from '../src/platform.js';
+import { ensureAgentsMdSymlink } from '../src/agent-config.js';
 
 // ── ANSI helpers ────────────────────────────────────────────────────────────
 const c = {
@@ -245,19 +246,6 @@ function updateOpenCodeDefaultModel(model: string): void {
   }
   raw['model'] = model;
   fs.writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', 'utf-8');
-}
-
-function ensureAgentsMdSymlink(dir: string): boolean {
-  const claudeMd = path.join(dir, 'CLAUDE.md');
-  const agentsMd = path.join(dir, 'AGENTS.md');
-  if (!fs.existsSync(claudeMd) || fs.existsSync(agentsMd)) return false;
-
-  try {
-    fs.symlinkSync('CLAUDE.md', agentsMd);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 type SetupProviderType = Extract<ProviderType, 'claude' | 'opencode' | 'gemini' | 'codex' | 'acp'>;

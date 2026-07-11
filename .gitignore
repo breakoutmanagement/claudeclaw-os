@@ -131,3 +131,6 @@ agents/*/agent.yaml.backup
 # CWDs (sub-agents start with cwd=agents/<id>).
 .claude/claudex/
 agents/*/.claude/claudex/
+
+# Generated at setup/agent-create by ensureAgentsMdSymlink (symlink or copy of CLAUDE.md); not tracked so a committed symlink can't check out broken on Windows
+agents/*/AGENTS.md
