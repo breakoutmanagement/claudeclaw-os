@@ -13,10 +13,48 @@ import type {
   AskUserQuestionRequest,
 } from './types.js';
 
+// Locate a system-installed `claude` on PATH, or undefined if none is found.
+function findSystemClaude(): string | undefined {
+  try {
+    const found = execSync('command -v claude', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return found || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Detect older Intel Macs whose CPU lacks AVX. The SDK's bundled Bun binary
+// hangs silently (rather than crashing) on these, stalling every agent query
+// until the turn timeout fires. macOS reports AVX as "AVX1.0" in
+// machdep.cpu.features — the base CPU-features key, present on every x86 Mac.
+// We deliberately do NOT query machdep.cpu.leaf7_features (AVX2): it is absent
+// on exactly the pre-AVX CPUs we target, so bundling it would make sysctl exit
+// nonzero and skip the fallback for the machines that need it. Only meaningful
+// on darwin/x64 — Apple Silicon and non-Mac platforms return false.
+function isIntelMacWithoutAvx(): boolean {
+  if (process.platform !== 'darwin' || process.arch !== 'x64') return false;
+  try {
+    const features = execSync('sysctl -n machdep.cpu.features', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return !/\bAVX/i.test(features);
+  } catch {
+    // sysctl unavailable — can't confirm, so don't force an override.
+    return false;
+  }
+}
+
 // Pick the `claude` binary to run only when we must override the SDK default.
-// The SDK's bundled Linux binary can't exec on NixOS (no ld-linux), which
-// crashes the process — so on Nix we point it at the system `claude`. Returns
-// undefined everywhere else, leaving the SDK's own resolution untouched.
+// The SDK's bundled binary can't run in two known cases, and returns undefined
+// everywhere else (leaving the SDK's own resolution untouched):
+//   - NixOS: the bundled Linux binary can't exec (no ld-linux) and crashes.
+//   - Older Intel Macs without AVX: the bundled Bun hangs silently, stalling
+//     every query to the timeout instead of crashing.
+// In both cases we point the SDK at the system `claude` instead.
 function resolveClaudeExecutableOverride(): string | undefined {
   const override = process.env.CLAUDECLAW_CLAUDE_EXECUTABLE_PATH?.trim();
   if (override) {
@@ -24,19 +62,26 @@ function resolveClaudeExecutableOverride(): string | undefined {
     return override;
   }
   if (process.platform === 'linux' && existsSync('/etc/NIXOS')) {
-    try {
-      const found = execSync('command -v claude', {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim();
-      if (found) {
-        logger.info({ path: found }, 'NixOS detected — using the system claude CLI (bundled binary cannot run on Nix)');
-        return found;
-      }
-    } catch {
-      // no system claude on PATH; fall through to the warning
+    const found = findSystemClaude();
+    if (found) {
+      logger.info({ path: found }, 'NixOS detected — using the system claude CLI (bundled binary cannot run on Nix)');
+      return found;
     }
     logger.warn('NixOS detected but no `claude` on PATH. Install claude-code or set CLAUDECLAW_CLAUDE_EXECUTABLE_PATH.');
+  }
+  if (isIntelMacWithoutAvx()) {
+    const found = findSystemClaude();
+    if (found) {
+      logger.info(
+        { path: found },
+        'Intel Mac without AVX detected — using the system claude CLI (bundled Bun binary hangs silently on non-AVX CPUs)',
+      );
+      return found;
+    }
+    logger.warn(
+      'Intel Mac without AVX detected and no `claude` on PATH. The SDK\'s bundled binary will hang silently until the ' +
+        'turn timeout. Install claude-code or set CLAUDECLAW_CLAUDE_EXECUTABLE_PATH to your system claude (e.g. /usr/local/bin/claude).',
+    );
   }
   return undefined;
 }
