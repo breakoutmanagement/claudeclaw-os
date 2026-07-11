@@ -54,6 +54,7 @@ import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, Provid
 import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
+import { applyOtherSelection, stepHint } from './auq-selection.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 import {
@@ -482,12 +483,17 @@ function makeToken(): string {
   return Math.random().toString(36).slice(2, 8);
 }
 
-/** Text for the current step: "(2/3) <question>" when there are several. */
+/**
+ * Text for the current step: "(2/3) <question>" when there are several, plus a
+ * hint telling the user whether to pick one or check several. Multi-select is
+ * easy to miss on Telegram (a tap doesn't auto-advance like single-select), so
+ * the cue points them at Done.
+ */
 function buildStepText(q: PendingQuestion): string {
   const n = q.request.questions.length;
   const cur = q.request.questions[q.current];
   const prefix = n > 1 ? `(${q.current + 1}/${n}) ` : '';
-  return `${prefix}${cur.question}`;
+  return `${prefix}${cur.question}\n_${stepHint(!!cur.multiSelect)}_`;
 }
 
 /**
@@ -702,7 +708,12 @@ async function maybeCaptureOtherReply(ctx: Context, chatIdStr: string, message: 
   const q = pendingQuestions.get(token);
   if (!q || !q.awaitingOther) return false;
 
-  q.selections[q.current] = [message.trim()];
+  const cur = q.request.questions[q.current];
+  q.selections[q.current] = applyOtherSelection(
+    q.selections[q.current] ?? [],
+    message,
+    !!cur.multiSelect,
+  );
   q.awaitingOther = false;
   // Record only — re-render the step so the user can Next/Done from here.
   if (q.messageId) {
@@ -1896,6 +1907,16 @@ export function createBot(): Bot {
       return;
     }
     touchActivity();
+
+    // ── AskUserQuestion "Other" free-text reply ─────────────────────
+    // Must be captured OUTSIDE the serial message queue. The turn that opened
+    // the question is still in-flight awaiting the resolver, so an enqueued
+    // reply would sit behind it forever — the user then taps Done (a callback,
+    // which bypasses the queue), the question finalizes with this slot empty
+    // (reported as skipped), and the queued text later fires as a stray new
+    // turn. Handling it inline here (like a callback tap) resolves the pending
+    // question immediately.
+    if (await maybeCaptureOtherReply(ctx, chatIdStr, text)) return;
 
     // ── WhatsApp state machine ──────────────────────────────────────
     const state = waState.get(chatIdStr);
