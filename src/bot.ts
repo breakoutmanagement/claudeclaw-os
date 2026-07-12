@@ -44,7 +44,7 @@ import {
 import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
 import { resolvePrimaryAgentId, setAgentProvider } from './agent-config.js';
 import { logger } from './logger.js';
-import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
+import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage, buildMediaGroupMessage, createMediaGroupBuffer } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
@@ -2103,6 +2103,33 @@ export function createBot(): Bot {
   });
 
   // Photos — download and pass to Claude
+  // --- Telegram albums (media groups) ---
+  // Multiple files sent together arrive as separate updates sharing a
+  // media_group_id, with the caption on only one. Buffer them (debounced) and
+  // submit ONE turn with all files + the caption, instead of one file per turn.
+  // Latest ctx per group key, used to reply to the chat when the group flushes.
+  const mediaGroupCtx = new Map<string, Context>();
+  const mediaBuffer = createMediaGroupBuffer({
+    onFlush: (key, items, caption) => {
+      const ctx = mediaGroupCtx.get(key);
+      mediaGroupCtx.delete(key);
+      if (!ctx) return;
+      const chatId = key.split(':')[0];
+      const msg = buildMediaGroupMessage(items, caption);
+      messageQueue.enqueue(chatId, () => handleMessage(ctx, msg));
+    },
+  });
+  // Register album membership at message ARRIVAL (before awaiting the download),
+  // passing the download as a promise, so slow downloads can't split the group.
+  function bufferMediaGroup(
+    ctx: Context, chatId: number, groupId: string,
+    item: Promise<{ path: string; label?: string }>, caption?: string,
+  ): void {
+    const key = `${chatId}:${groupId}`;
+    mediaGroupCtx.set(key, ctx); // latest ctx is fine for replying to the chat
+    mediaBuffer.add(key, item, caption);
+  }
+
   bot.on('message:photo', async (ctx) => {
     const chatId = ctx.chat!.id;
     if (!isAuthorised(chatId)) return;
@@ -2115,6 +2142,12 @@ export function createBot(): Bot {
 
     try {
       const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const gid = ctx.message.media_group_id;
+      if (gid) {
+        const dl = downloadMedia(activeBotToken, photo.file_id, 'photo.jpg').then((path) => ({ path }));
+        bufferMediaGroup(ctx, chatId, gid, dl, ctx.message.caption ?? undefined);
+        return;
+      }
       const localPath = await downloadMedia(activeBotToken, photo.file_id, 'photo.jpg');
       const msg = buildPhotoMessage(localPath, ctx.message.caption ?? undefined);
       const chatIdStr = chatId.toString();
@@ -2139,6 +2172,12 @@ export function createBot(): Bot {
     try {
       const doc = ctx.message.document;
       const filename = doc.file_name ?? 'file';
+      const gid = ctx.message.media_group_id;
+      if (gid) {
+        const dl = downloadMedia(activeBotToken, doc.file_id, filename).then((path) => ({ path, label: filename }));
+        bufferMediaGroup(ctx, chatId, gid, dl, ctx.message.caption ?? undefined);
+        return;
+      }
       const localPath = await downloadMedia(activeBotToken, doc.file_id, filename);
       const msg = buildDocumentMessage(localPath, filename, ctx.message.caption ?? undefined);
       const chatIdStr = chatId.toString();
