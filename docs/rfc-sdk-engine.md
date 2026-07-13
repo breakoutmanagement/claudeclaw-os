@@ -1,11 +1,12 @@
 ---
-Author: Michael Kidder
+Author: promptadvisers
+Contributors: JJ Eaton (PR #58 - provider engine + ACP)
 Title: Agent Provider Engine
 Status: Implemented for current provider paths; direct Anthropic SDK backend remains a follow-up
 Component: provider engine / agent invocation seam
 ---
 
-# RFC: Agent Provider Engine
+# Agent Provider Engine
 
 ## Summary
 

@@ -6,7 +6,7 @@ Created: 2026-07-10
 Component: session restore / context management
 ---
 
-# RFC: `/respin` enhancement + `/respin-session` checkpoint restore
+# `/respin` enhancement + `/respin-session` checkpoint restore
 
 ## 1. Summary
 

@@ -6,7 +6,7 @@ Created: 2026-07-08
 Component: agent identity / name-to-id routing
 ---
 
-# RFC: Agent Identity Reconciliation
+# Agent Identity Reconciliation
 
 ## Problem
 

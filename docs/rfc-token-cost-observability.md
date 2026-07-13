@@ -6,7 +6,7 @@ Created: 2026-07-09
 Component: token/cost telemetry / metered-billing observability
 ---
 
-# RFC: Token / Cost Observability (metered-billing readiness)
+# Token / Cost Observability (metered-billing readiness)
 
 ## Why
 

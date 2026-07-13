@@ -6,7 +6,7 @@ Created: 2026-07-12
 Component: setup / config generation / mission-cli / hive accessor / docs
 ---
 
-# RFC: Agent Awareness & Deterministic Comms
+# Agent Awareness & Deterministic Comms
 
 ## Summary
 
