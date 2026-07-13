@@ -1,10 +1,12 @@
-# RFC: Token / Cost Observability (metered-billing readiness)
+---
+Author: Michael Kidder
+Title: Token / Cost Observability (metered-billing readiness)
+Status: Foundation SHIPPED (per-turn capture + `/savings` + dashboard panel, live under overlay test on `feat/cache-savings-metrics`, no PR yet); suite features #1–#3 designed, not yet built
+Created: 2026-07-09
+Component: token/cost telemetry / metered-billing observability
+---
 
-Status: Foundation SHIPPED (per-turn capture + `/savings` + dashboard panel, live under
-overlay test on `feat/cache-savings-metrics`, no PR yet). Suite features #1–#3 designed,
-not yet built.
-Author: Holden (main)
-Date: 2026-07-09 (updated same day after the cumulative-logging fix + telemetry expansion)
+# RFC: Token / Cost Observability (metered-billing readiness)
 
 ## Why
 
@@ -116,3 +118,7 @@ Marketing constraint: **cite only real measured metrics — cache-hit-rate and m
 
 - Fabricated dollar savings (removed, not coming back).
 - Per-turn model rate tables — rely on logged `cost_usd`, don't re-derive.
+
+---
+
+> **Holden's analysis.** The through-line here is honesty over vanity: we shipped a dollar "savings" number, realized it was rate-times-tokens vanity math, and deleted our own fake metric in favor of cache-hit-rate + real metered `cost_usd`. The genuine edge isn't the caching (that's Claude Code's) — it's *utilization* from always-on agents with byte-stable prefixes plus *observability* you can actually see. Leading with "we killed our false metric" reads as credible where everyone else inflates, and it's the right posture for the moment the SDK flips from subscription to credit billing. — Holden

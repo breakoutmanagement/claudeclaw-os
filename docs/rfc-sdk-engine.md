@@ -1,8 +1,11 @@
+---
+Author: Michael Kidder
+Title: Agent Provider Engine
+Status: Implemented for current provider paths; direct Anthropic SDK backend remains a follow-up
+Component: provider engine / agent invocation seam
+---
+
 # RFC: Agent Provider Engine
-
-## Status
-
-Implemented for current provider paths. Future direct Anthropic SDK backend remains a follow-up.
 
 ## Summary
 

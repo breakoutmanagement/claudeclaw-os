@@ -1,8 +1,12 @@
-# RFC: Agent Identity Reconciliation
-
+---
+Author: Michael Kidder
+Title: Agent Identity Reconciliation
 Status: Draft (plan-first, no code yet)
-Author: Holden (main)
-Date: 2026-07-08
+Created: 2026-07-08
+Component: agent identity / name-to-id routing
+---
+
+# RFC: Agent Identity Reconciliation
 
 ## Problem
 

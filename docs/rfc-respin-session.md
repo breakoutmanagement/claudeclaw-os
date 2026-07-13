@@ -1,11 +1,12 @@
-# RFC: `/respin` enhancement + `/respin-session` checkpoint restore
-
-**Status:** Draft — earmarked for Claude Code handoff
-**Author:** Holden (main) w/ Mike
-**Date:** 2026-07-10
-**Convention:** follows `docs/rfc-*.md` (see `rfc-agent-identity-reconciliation.md`)
-
 ---
+Author: Michael Kidder
+Title: `/respin` enhancement + `/respin-session` checkpoint restore
+Status: Draft — earmarked for Claude Code handoff
+Created: 2026-07-10
+Component: session restore / context management
+---
+
+# RFC: `/respin` enhancement + `/respin-session` checkpoint restore
 
 ## 1. Summary
 
@@ -131,3 +132,7 @@ mechanics to build on:
 - AskUserQuestion → Telegram inline-keyboard bridge (`bot.ts`, PR #101; multi-
   select + Other free-text extensions).
 - `memories` table (`pinned` column) in `store/claudeclaw.db`.
+
+---
+
+> **Holden's analysis.** This one came out of a real failure — parking a session, watching memory-hygiene fatten the prefix, and hitting "Prompt is too long." The insight that fell out of it: `/respin` was silently conflating two jobs, recency-restore ("put me back in the room I just left") and checkpoint-restore ("drop me at the deliberate save point"), and only ever did the first. Checkpoints are an underused power play — `/respin-session` turns a passive memory mechanism into a button you can press to teleport back to a deliberate save state, and making both commands *replace* context rather than stack is what structurally kills the fat-prefix trap. — Holden
