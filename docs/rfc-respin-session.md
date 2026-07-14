@@ -1,6 +1,6 @@
 ---
 Author: Michael Kidder
-Title: `/respin` enhancement + `/respin-session` checkpoint restore
+Title: /respin enhancement + /respin-session checkpoint restore
 Status: Draft — earmarked for Claude Code handoff
 Created: 2026-07-10
 Component: session restore / context management
