@@ -115,8 +115,16 @@ function writeMainConfig(raw: Record<string, unknown>): void {
 // legacy main-config.json provider into agent.yaml once (creating the
 // file if it doesn't exist), then agent.yaml is the single source.
 
+function externalMainAgentYamlPath(): string {
+  return path.join(CLAUDECLAW_CONFIG, 'agents', 'main', 'agent.yaml');
+}
+
+// Reads honor a pre-existing legacy file in PROJECT_ROOT (from installs
+// created before this fallback was fixed, or a manually placed file) so
+// nothing already-written silently stops being read. Writes never target
+// PROJECT_ROOT — see writeMainAgentYaml below.
 function mainAgentYamlPath(): string {
-  const externalPath = path.join(CLAUDECLAW_CONFIG, 'agents', 'main', 'agent.yaml');
+  const externalPath = externalMainAgentYamlPath();
   if (fs.existsSync(externalPath)) return externalPath;
   return path.join(PROJECT_ROOT, 'agents', 'main', 'agent.yaml');
 }
@@ -132,9 +140,13 @@ function readMainAgentYaml(): Record<string, unknown> | undefined {
 }
 
 function writeMainAgentYaml(raw: Record<string, unknown>): void {
-  // Prefer the external config dir for a fresh file; that's where agent
-  // yamls live on a configured install.
-  const p = mainAgentYamlPath();
+  // Always target the external config dir, fresh file or not — that's
+  // where agent yamls live on a configured install, and it's what keeps
+  // this out of the repo/install checkout (agents/*/agent.yaml is
+  // gitignored on purpose; see config.ts's CLAUDECLAW_CONFIG comment).
+  // A write also migrates any legacy PROJECT_ROOT file forward, since the
+  // next read call will find the external file first.
+  const p = externalMainAgentYamlPath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, yaml.dump(raw, { lineWidth: -1 }), 'utf-8');
 }
