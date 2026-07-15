@@ -151,6 +151,64 @@ function writeMainAgentYaml(raw: Record<string, unknown>): void {
   fs.writeFileSync(p, yaml.dump(raw, { lineWidth: -1 }), 'utf-8');
 }
 
+// Minimal main agent.yaml written for a truly fresh install. Mirrors what
+// step 6b of the setup wizard produces (scripts/setup.ts). Deliberately
+// carries NO provider/model block: main's provider defaults are resolved
+// from env/config (DEFAULT_CLAUDE_MODEL) until something explicitly sets a
+// provider, so baking one here would pin a model and defeat env-driven
+// model upgrades.
+const MINIMAL_MAIN_AGENT_YAML = [
+  '# Main agent configuration',
+  'name: Main',
+  '',
+  '# The main agent uses TELEGRAM_BOT_TOKEN from .env (no override needed).',
+  '# telegram_bot_token_env: TELEGRAM_BOT_TOKEN',
+  '',
+  '# The provider/model are persisted here once set (dashboard picker or',
+  '# /model). Until then main uses the env/config default.',
+  '',
+].join('\n');
+
+/**
+ * Idempotently ensure main's external config exists on boot, independent of
+ * whether the interactive setup wizard was ever run.
+ *
+ * The setup wizard's step 6b is the ONLY thing that historically created
+ * CLAUDECLAW_CONFIG/agents/main/agent.yaml. Headless/VPS deploys (clone,
+ * npm install, hand-written .env, pm2/systemd) skip the wizard, so the file
+ * never existed — leaving reads and (pre-#147) writes to fall through to
+ * PROJECT_ROOT, the exact virgin state behind the config-poisoning class of
+ * bugs (see issue #146/#148). Making the runtime bootstrap its own config
+ * removes that coupling: the invariant becomes "the process created the
+ * file," not "a human ran the wizard."
+ *
+ * Ordering preserves #147's self-heal:
+ *  - External file already present → nothing to do.
+ *  - A legacy PROJECT_ROOT/agents/main/agent.yaml exists (pre-#147 install) →
+ *    copy it forward VERBATIM so its provider (if any) and name are
+ *    preserved and it stops being the read source. Copying rather than
+ *    writing a stub avoids shadowing a legacy provider with an empty file.
+ *  - Truly virgin → write the minimal, provider-less template.
+ *
+ * Safe to call unconditionally on every main-process boot.
+ */
+export function ensureMainAgentConfig(): void {
+  const external = externalMainAgentYamlPath();
+  fs.mkdirSync(path.dirname(external), { recursive: true });
+  if (fs.existsSync(external)) return;
+
+  const legacyRoot = path.join(PROJECT_ROOT, 'agents', 'main', 'agent.yaml');
+  if (fs.existsSync(legacyRoot)) {
+    try {
+      const raw = fs.readFileSync(legacyRoot, 'utf-8');
+      fs.writeFileSync(external, raw, 'utf-8');
+      return;
+    } catch { /* unreadable legacy file — fall through to the minimal template */ }
+  }
+
+  fs.writeFileSync(external, MINIMAL_MAIN_AGENT_YAML, 'utf-8');
+}
+
 export function getMainProviderConfig(): ProviderConfig {
   const agentYaml = readMainAgentYaml();
 
