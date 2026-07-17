@@ -26,6 +26,7 @@ import {
   getDashboardMemoriesList,
   getDashboardTokenStats,
   getDashboardCostTimeline,
+  getCacheTokens,
   getDashboardRecentTokenUsage,
   getSession,
   getSessionTokenUsage,
@@ -2222,6 +2223,19 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const costTimeline = getDashboardCostTimeline(chatId, 30);
     const recentUsage = getDashboardRecentTokenUsage(chatId, 20);
     return c.json({ stats, costTimeline, recentUsage });
+  });
+
+  // Per-agent cache token usage over a selectable window (own endpoint so the
+  // dashboard panel's timeframe toggle re-fetches independently of the rest
+  // of the Usage page). days clamped to 1..365, default 30.
+  app.get('/api/cache-tokens', (c) => {
+    const chatId = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
+    const days = Math.min(365, Math.max(1, Number.parseInt(c.req.query('days') || '', 10) || 30));
+    const cacheTokens = getCacheTokens(chatId, days).map((r) => ({
+      ...r,
+      displayName: resolveAgentDisplayName(r.agentId),
+    }));
+    return c.json({ days, cacheTokens });
   });
 
   // Bot info (name, PID, chatId) — reads dynamically from state

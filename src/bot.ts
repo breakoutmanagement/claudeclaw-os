@@ -41,8 +41,8 @@ import {
   CLAUDE_MODEL_SONNET,
   CLAUDE_MODEL_HAIKU,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
-import { resolvePrimaryAgentId, setAgentProvider } from './agent-config.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice, getCacheTokens } from './db.js';
+import { resolvePrimaryAgentId, setAgentProvider, resolveAgentDisplayName } from './agent-config.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage, buildMediaGroupMessage, createMediaGroupBuffer } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -1237,12 +1237,21 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           activeSessionId,
           result.usage.inputTokens,
           result.usage.outputTokens,
-          result.usage.lastCallCacheRead,
+          result.usage.cacheReadInputTokens,
           result.usage.lastCallCacheRead + result.usage.lastCallInputTokens,
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
           result.usage.contextWindow,
+          result.usage.cacheCreationInputTokens,
+          {
+            model: result.usage.model,
+            durationMs: result.usage.durationMs,
+            durationApiMs: result.usage.durationApiMs,
+            numTurns: result.usage.numTurns,
+            stopReason: result.usage.stopReasonDetail,
+            isError: result.usage.isError,
+          },
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
@@ -1415,6 +1424,7 @@ export function createBot(): Bot {
     { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
     { command: 'provider', description: 'Show active provider' },
     { command: 'memory', description: 'View recent memories' },
+    { command: 'cache', description: 'Per-agent prompt-cache usage' },
     { command: 'forget', description: 'Clear session' },
     { command: 'wa', description: 'Recent WhatsApp messages' },
     { command: 'slack', description: 'Recent Slack messages' },
@@ -1453,6 +1463,7 @@ export function createBot(): Bot {
       '/model — Switch model (opus/sonnet/haiku)\n' +
       '/provider — Show active provider/model source\n' +
       '/memory — View recent memories\n' +
+      '/cache — Per-agent prompt-cache usage ([days], default 30)\n' +
       '/forget — Clear session\n' +
       '/wa — WhatsApp messages\n' +
       '/slack — Slack messages\n' +
@@ -1698,6 +1709,41 @@ export function createBot(): Bot {
     }
   });
 
+  // /cache [days] — per-agent prompt-cache token usage over a window (default 30d)
+  bot.command('cache', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const chatId = ctx.chat!.id.toString();
+    const days = Math.min(365, Math.max(1, Number.parseInt(ctx.match?.trim() || '', 10) || 30));
+    const rows = getCacheTokens(chatId, days);
+    if (rows.length === 0) {
+      await ctx.reply(`No cache activity in the last ${days}d yet.`);
+      return;
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    // Cache hit rate = share of prompt-input tokens served from cache.
+    const hitRate = (read: number, write: number, input: number): string => {
+      const total = read + write + input;
+      return total > 0 ? `${((read / total) * 100).toFixed(1)}%` : 'n/a';
+    };
+    let totalRead = 0;
+    let totalCreate = 0;
+    let totalInput = 0;
+    const lines = rows.map((r) => {
+      totalRead += r.cacheRead;
+      totalCreate += r.cacheCreation;
+      totalInput += r.inputTokens;
+      return `<b>${escapeHtml(resolveAgentDisplayName(r.agentId))}</b> · ${fmt(r.turns)} turns · hit <b>${hitRate(r.cacheRead, r.cacheCreation, r.inputTokens)}</b>\n` +
+        `  read ${fmt(r.cacheRead)} · write ${fmt(r.cacheCreation)} tok`;
+    });
+    const header = `<b>Cache usage — last ${days}d</b>\n` +
+      `Hit rate <b>${hitRate(totalRead, totalCreate, totalInput)}</b> · read ${fmt(totalRead)} / write ${fmt(totalCreate)} tok`;
+    const footer = `<i>hit rate = cached-read share of prompt input (measured token counts, not dollars)</i>`;
+    const reply = `${header}\n\n${lines.join('\n')}\n\n${footer}`;
+    for (const part of splitMessage(reply)) {
+      await ctx.reply(part, { parse_mode: 'HTML' });
+    }
+  });
+
   // /pin <id> — make a memory permanent (never decays)
   bot.command('pin', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
@@ -1925,7 +1971,7 @@ export function createBot(): Bot {
   });
 
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/await', '/gather', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/cache', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/await', '/gather', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -2461,12 +2507,21 @@ async function processDashboardMessage(
           activeSessionId,
           result.usage.inputTokens,
           result.usage.outputTokens,
-          result.usage.lastCallCacheRead,
+          result.usage.cacheReadInputTokens,
           result.usage.lastCallCacheRead + result.usage.lastCallInputTokens,
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
           result.usage.contextWindow,
+          result.usage.cacheCreationInputTokens,
+          {
+            model: result.usage.model,
+            durationMs: result.usage.durationMs,
+            durationApiMs: result.usage.durationApiMs,
+            numTurns: result.usage.numTurns,
+            stopReason: result.usage.stopReasonDetail,
+            isError: result.usage.isError,
+          },
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');

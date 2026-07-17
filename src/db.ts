@@ -167,10 +167,17 @@ function createSchema(database: Database.Database): void {
       input_tokens    INTEGER NOT NULL DEFAULT 0,
       output_tokens   INTEGER NOT NULL DEFAULT 0,
       cache_read      INTEGER NOT NULL DEFAULT 0,
+      cache_creation  INTEGER NOT NULL DEFAULT 0,
       context_tokens  INTEGER NOT NULL DEFAULT 0,
       context_window  INTEGER,
       cost_usd        REAL NOT NULL DEFAULT 0,
       did_compact     INTEGER NOT NULL DEFAULT 0,
+      model           TEXT,
+      duration_ms     INTEGER NOT NULL DEFAULT 0,
+      duration_api_ms INTEGER NOT NULL DEFAULT 0,
+      num_turns       INTEGER NOT NULL DEFAULT 0,
+      stop_reason     TEXT,
+      is_error        INTEGER NOT NULL DEFAULT 0,
       created_at      INTEGER NOT NULL
     );
 
@@ -508,6 +515,28 @@ function runMigrations(database: Database.Database): void {
   const usageCols = database.prepare(`PRAGMA table_info(token_usage)`).all() as Array<{ name: string }>;
   if (!usageCols.some((c) => c.name === 'agent_id')) {
     database.exec(`ALTER TABLE token_usage ADD COLUMN agent_id TEXT NOT NULL DEFAULT 'main'`);
+  }
+  if (!usageCols.some((c) => c.name === 'cache_creation')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN cache_creation INTEGER NOT NULL DEFAULT 0`);
+  }
+  // Per-turn telemetry columns (free from the SDK result object).
+  if (!usageCols.some((c) => c.name === 'model')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN model TEXT`);
+  }
+  if (!usageCols.some((c) => c.name === 'duration_ms')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!usageCols.some((c) => c.name === 'duration_api_ms')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN duration_api_ms INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!usageCols.some((c) => c.name === 'num_turns')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN num_turns INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!usageCols.some((c) => c.name === 'stop_reason')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN stop_reason TEXT`);
+  }
+  if (!usageCols.some((c) => c.name === 'is_error')) {
+    database.exec(`ALTER TABLE token_usage ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0`);
   }
 
   const convoCols = database.prepare(`PRAGMA table_info(conversation_log)`).all() as Array<{ name: string }>;
@@ -1797,12 +1826,29 @@ export function saveTokenUsage(
   didCompact: boolean,
   agentId = 'main',
   contextWindow: number | null = null,
+  cacheCreation = 0,
+  telemetry: {
+    model?: string | null;
+    durationMs?: number;
+    durationApiMs?: number;
+    numTurns?: number;
+    stopReason?: string | null;
+    isError?: boolean;
+  } = {},
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, context_window)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, contextWindow);
+    `INSERT INTO token_usage (chat_id, session_id, input_tokens, output_tokens, cache_read, context_tokens, cost_usd, did_compact, created_at, agent_id, context_window, cache_creation, model, duration_ms, duration_api_ms, num_turns, stop_reason, is_error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    chatId, sessionId ?? null, inputTokens, outputTokens, cacheRead, contextTokens, costUsd, didCompact ? 1 : 0, now, agentId, contextWindow, cacheCreation,
+    telemetry.model ?? null,
+    telemetry.durationMs ?? 0,
+    telemetry.durationApiMs ?? 0,
+    telemetry.numTurns ?? 0,
+    telemetry.stopReason ?? null,
+    telemetry.isError ? 1 : 0,
+  );
 }
 
 export interface SessionTokenSummary {
@@ -1967,6 +2013,40 @@ export function getDashboardCostTimeline(chatId: string, days = 30): { date: str
        ORDER BY date`,
     )
     .all(chatId, `-${days} days`) as { date: string; cost: number; turns: number }[];
+}
+
+export interface CacheTokensRow {
+  agentId: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheCreation: number;
+  costUsd: number;
+}
+
+/**
+ * Per-agent prompt-cache token usage over the last `days`, scoped to a chat.
+ * Reports measured token counts only (cache read/write, input/output) plus
+ * metered cost_usd — no derived "savings" figure (honest metrics only).
+ */
+export function getCacheTokens(chatId: string, days = 30): CacheTokensRow[] {
+  return db
+    .prepare(
+      `SELECT
+         agent_id                       as agentId,
+         COUNT(*)                       as turns,
+         COALESCE(SUM(input_tokens), 0) as inputTokens,
+         COALESCE(SUM(output_tokens), 0) as outputTokens,
+         COALESCE(SUM(cache_read), 0)   as cacheRead,
+         COALESCE(SUM(cache_creation), 0) as cacheCreation,
+         COALESCE(SUM(cost_usd), 0)     as costUsd
+       FROM token_usage
+       WHERE chat_id = ? AND created_at >= unixepoch('now', ?)
+       GROUP BY agent_id
+       ORDER BY cacheRead DESC`,
+    )
+    .all(chatId, `-${days} days`) as CacheTokensRow[];
 }
 
 export interface RecentTokenUsageRow {

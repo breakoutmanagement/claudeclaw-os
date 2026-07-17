@@ -134,6 +134,25 @@ function pickContextWindow(modelUsage: unknown, model: string | undefined): numb
 }
 
 /**
+ * Pick the model that did the bulk of the work this turn from `modelUsage`
+ * (`Record<modelId, { inputTokens, outputTokens }>`) — the key with the most
+ * input+output tokens. A single-model turn has one key; multi-model turns
+ * (e.g. a sub-agent on a cheaper model) resolve to the dominant one. Null when
+ * no usable entry exists. Used only for telemetry attribution.
+ */
+function pickModel(modelUsage: unknown): string | null {
+  if (!modelUsage || typeof modelUsage !== 'object') return null;
+  const entries = Object.entries(modelUsage as Record<string, { inputTokens?: number; outputTokens?: number }>);
+  let best: string | null = null;
+  let bestTokens = -1;
+  for (const [id, v] of entries) {
+    const t = (v?.inputTokens ?? 0) + (v?.outputTokens ?? 0);
+    if (t > bestTokens) { bestTokens = t; best = id; }
+  }
+  return best;
+}
+
+/**
  * Build a `canUseTool` callback that bridges the built-in AskUserQuestion tool
  * to an interactive resolver (e.g. a Telegram inline keyboard).
  *
@@ -208,6 +227,7 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
     let didCompact = false;
     let preCompactTokens: number | null = null;
     let lastCallCacheRead = 0;
+    let lastCallCacheCreation = 0;
     let lastCallInputTokens = 0;
     let streamedText = '';
     let emittedResult = false;
@@ -285,8 +305,10 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
         const msg = ev.message as Record<string, unknown> | undefined;
         const msgUsage = msg?.usage as Record<string, number> | undefined;
         const callCacheRead = msgUsage?.cache_read_input_tokens ?? 0;
+        const callCacheCreation = msgUsage?.cache_creation_input_tokens ?? 0;
         const callInputTokens = msgUsage?.input_tokens ?? 0;
         if (callCacheRead > 0) lastCallCacheRead = callCacheRead;
+        if (callCacheCreation > 0) lastCallCacheCreation = callCacheCreation;
         if (callInputTokens > 0) lastCallInputTokens = callInputTokens;
 
         const content = msg?.content as Array<{ type: string; id?: string; name?: string; text?: string }> | undefined;
@@ -394,12 +416,20 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
           inputTokens: evUsage.input_tokens ?? 0,
           outputTokens: evUsage.output_tokens ?? 0,
           cacheReadInputTokens: evUsage.cache_read_input_tokens ?? 0,
+          cacheCreationInputTokens: evUsage.cache_creation_input_tokens ?? 0,
           totalCostUsd: (ev.total_cost_usd as number) ?? 0,
           didCompact,
           preCompactTokens,
           lastCallCacheRead,
+          lastCallCacheCreation,
           lastCallInputTokens,
           contextWindow: pickContextWindow(ev.modelUsage, input.model),
+          model: pickModel(ev.modelUsage) ?? input.model ?? null,
+          durationMs: (ev.duration_ms as number) ?? 0,
+          durationApiMs: (ev.duration_api_ms as number) ?? 0,
+          numTurns: (ev.num_turns as number) ?? 0,
+          stopReasonDetail: (typeof ev.stop_reason === 'string' ? ev.stop_reason : null),
+          isError: ev.is_error === true,
         } : null;
         if (usage) yield { type: 'usage', usage, raw: ev };
         yield {
