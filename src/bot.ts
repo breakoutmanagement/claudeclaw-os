@@ -1421,7 +1421,9 @@ export function createBot(): Bot {
     { command: 'dashboard', description: 'Open web dashboard' },
     { command: 'stop', description: 'Stop current processing' },
     { command: 'agents', description: 'List available agents' },
-    { command: 'delegate', description: 'Delegate task to agent' },
+    { command: 'delegate', description: 'Hand a task to one agent (async)' },
+    { command: 'await', description: 'Fan out to agents, wait for one summary' },
+    { command: 'gather', description: 'Fan out to agents, notify when all done' },
     { command: 'lock', description: 'Lock session (requires PIN to unlock)' },
     { command: 'status', description: 'Show security status' },
   ];
@@ -1457,10 +1459,16 @@ export function createBot(): Bot {
       '/dashboard — Web dashboard\n' +
       '/stop — Stop current processing\n' +
       '/agents — List available agents\n' +
-      '/delegate — Delegate task to agent\n' +
+      '/delegate — Hand a task to one agent, async (delegate)\n' +
+      '/await — Fan out to agents, wait for one combined summary\n' +
+      '/gather — Fan out to agents, get notified when all finish\n' +
       '/lock — Lock session (PIN required to unlock)\n' +
       '/status — Security status\n\n' +
-      'Delegation: @agentId: prompt or /delegate agentId prompt\n\n' +
+      'Orchestration: use the commands above, or just ask in plain English —\n' +
+      '  "have amos pull the SCCHA cards and report back" (delegate)\n' +
+      '  "ask naomi and amos each for today\'s highlights, wait for both" (await)\n' +
+      '  "kick off research across three agents and ping me when all are done" (gather)\n' +
+      'Shorthand: @agentId: prompt or /delegate agentId prompt\n\n' +
       'You can also send voice notes, photos, files, and videos.'
     );
   });
@@ -1888,8 +1896,36 @@ export function createBot(): Bot {
     messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/delegate ${args}`));
   });
 
+  // /await <agentId,agentId,...> <prompt> — fan out to agents and wait for one combined summary (blocking)
+  bot.command('await', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const args = ctx.match?.trim();
+    if (!args) {
+      const agents = getAvailableAgents();
+      const agentList = agents.length > 0 ? agents.map((a) => a.id).join(', ') : '(none configured)';
+      await ctx.reply(`Usage: /await <agentId,agentId,...> <prompt>\n\nSends the prompt to each agent and waits for one combined answer in this turn.\n\nAvailable agents: ${agentList}`);
+      return;
+    }
+    const chatIdStr = ctx.chat!.id.toString();
+    messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/await ${args}`));
+  });
+
+  // /gather <agentId,agentId,...> <prompt> — fan out to agents, get notified when all finish (non-blocking join)
+  bot.command('gather', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const args = ctx.match?.trim();
+    if (!args) {
+      const agents = getAvailableAgents();
+      const agentList = agents.length > 0 ? agents.map((a) => a.id).join(', ') : '(none configured)';
+      await ctx.reply(`Usage: /gather <agentId,agentId,...> <prompt>\n\nSends the prompt to each agent and pings you with one consolidated summary once the last one finishes.\n\nAvailable agents: ${agentList}`);
+      return;
+    }
+    const chatIdStr = ctx.chat!.id.toString();
+    messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/gather ${args}`));
+  });
+
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/await', '/gather', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();

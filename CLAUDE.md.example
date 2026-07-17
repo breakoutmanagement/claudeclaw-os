@@ -135,16 +135,29 @@ Other commands: `list`, `delete <id>`, `pause <id>`, `resume <id>`
 
 ---
 
-## Delegating to Other Agents
+## Orchestrating Other Agents
 
-When [YOUR NAME] says things like "have research look into X" or "get comms to handle Y":
+Agents do real work for each other via `mission-cli` (the shell). **Dispatch** is the umbrella verb — you dispatch a task in one of three modes:
 
-```bash
-PROJECT_ROOT=$(git rev-parse --show-toplevel)
-node "$PROJECT_ROOT/dist/mission-cli.js" create --agent research --title "Short label" "Full prompt"
-```
+- **delegate (1→1, async)** — hand one task to one agent; it reports back on its own when done. You are not waiting.
+  ```bash
+  PROJECT_ROOT=$(git rev-parse --show-toplevel)
+  node "$PROJECT_ROOT/dist/mission-cli.js" create --agent research --title "Short label" "Full prompt"
+  ```
+  The task is async — the target agent picks it up within 60 seconds and pings back when done.
+- **await (1→N, blocking)** — fan out to several agents and wait inline for ONE combined answer this turn. Use only when you need the answer right now. (No CLI verb — this is orchestrator behavior: fire N `create`s, read the results, compose one summary.)
+- **gather (1→N, non-blocking)** — fan out to several agents; the scheduler releases ONE consolidated summary when the last finishes. You walk away meanwhile.
+  ```bash
+  node "$PROJECT_ROOT/dist/mission-cli.js" gather --summary-agent main --title "Label" \
+    --task "research:question one" --task "comms:question two" "Produce one consolidated summary."
+  ```
 
-The task is async. The target agent picks it up within 60 seconds and pings back on Telegram when done.
+Rules that keep it deterministic:
+- **Handback goes to the ORIGINATOR** (the task's `created_by`), not always to you. Reply to whoever queued you. No hardcoded roster.
+- **Fan-out = collect then summarize once.** Handbacks are 1→1; never let each child narrate cross-task status (isolated turns guess wrong). One summary at the end.
+- **Never poll the database** for results. Handbacks and joins come back as mission-tasks the scheduler fires on their own; polling clogs the per-chat queue.
+
+Human shortcuts: [YOUR NAME] can drive the same three from Telegram — `/delegate`, `/await`, `/gather` — or just ask in plain English ("have research look into X", "ask comms and ops both, wait for both", "kick off all three and ping me when done"). Same actions, two entry points.
 
 Available agents: main, research, comms, content, ops. Use `--priority 10` for urgent.
 

@@ -103,6 +103,18 @@ node "$PROJECT_ROOT/dist/schedule-cli.js" list
 node "$PROJECT_ROOT/dist/schedule-cli.js" delete <id>
 ```
 
+## Reporting back (orchestration)
+
+When another agent (or the hub) hands you a mission-task, finish it and report back with `mission-cli handback` — it routes to the task's ORIGINATOR (`created_by`) automatically, no need to guess who:
+
+```bash
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+node "$PROJECT_ROOT/dist/mission-cli.js" handback <task-id> "Your report text"
+```
+
+- If your task is part of a fan-out (a `gather` group), just finish with your findings as your final output — do NOT fire a handback and do NOT try to summarize the other agents' work. The scheduler collects everyone and releases one combined summary.
+- Never poll the database waiting on other agents; results come back as mission-tasks on their own.
+
 ## Rules
 - You have access to all global skills in ~/.claude/skills/
 - Keep responses tight and actionable

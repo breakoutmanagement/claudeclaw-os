@@ -1,7 +1,7 @@
 ---
 Author: Michael Kidder
 Title: Agent Awareness & Deterministic Comms
-Status: Draft — Tier 1 built (feat/agent-self-location); tracked via GH issue
+Status: Draft — Tier 1 built (feat/agent-self-location, PR #142); Tier 2 built (feat/deterministic-comms); tracked via GH issue
 Created: 2026-07-12
 Component: setup / config generation / mission-cli / hive accessor / docs
 ---
@@ -18,8 +18,8 @@ This RFC makes both properties of the runtime/CLIs instead of the prompt:
 - **Tier 1 — Self-location:** every agent knows, from setup, its identity, config path, and resolved
   store path, and uses a **store-aware accessor** to touch its hive mind (never a raw sqlite path).
 - **Tier 2 — Deterministic comms:** a handback resolves to the task's originator (`created_by`), so an
-  agent only needs to know "reply to whoever queued me." New-work routing is validated by a CLI
-  owner-lane map, not carried in any agent's head.
+  agent only needs to know "reply to whoever queued me." The resolution is generic (agent id vs. a
+  small set of non-agent origin sentinels) — no fleet-specific roster or org chart in shipped code.
 
 Net effect: behavior is deterministic and **model-independent**, which is exactly what we need as
 non-Claude/untrusted models (e.g. GPT via proxy) get put in the seat.
@@ -85,25 +85,81 @@ Two live findings on 2026-07-12, both verified from source:
 
 - **Handback resolves to `created_by`.** Add `mission-cli handback <task-id> "<report>"`: recipient is
   the task's originator, looked up from the row — the agent supplies no agent id. Store `parent_task_id`
-  for the chain. **`created_by` is not always an agent — the resolution table must be explicit or
-  automated handbacks dead-end:**
+  for the chain. **`created_by` is not always an agent, so resolution must never dead-end.** The rule is
+  generic and roster-free: a small set of **reserved non-agent origin sentinels** routes to the human;
+  **anything else is treated as an agent id and the mission routes straight back to it.** No list of
+  specific agent names is compiled into shipped code.
   | `created_by` | Handback destination |
   |---|---|
-  | an agent id (holden/naomi/amos/…) | that agent's mission board |
-  | `human` / a Mike chat id | Mike on Telegram |
-  | `dashboard` (the default origin) | Mike on Telegram (dashboard has no inbox to consume a mission) |
-  | `scheduled` / cron-origin | the job's **owning** agent (via the lane/owner it was created under); fall back to Mike if unattributable |
-  Pin this mapping in code; a `dashboard`- or `scheduled`-origin handback with no rule is the failure
-  case to eliminate.
-- **Owner-validated dispatch.** A committed owner-lane map (feed/Skool→naomi, code→holden, Jira→amos,
-  billing→alex, knowledge/Obsidian→drummer). `mission-cli create` auto-routes by `--lane` when
-  `--assign` is omitted, and rejects (or warns+`--force`) a mismatch. The agent doesn't carry the map.
+  | a reserved sentinel: `dashboard` (default origin), `human`, or a numeric chat id | surface to the human (dashboard/human have no mission inbox) |
+  | `scheduled` / cron-origin | surface to the human (unattributable to an agent inbox by itself) |
+  | anything else | treated as the originating agent id → that agent's mission board |
+
+  Reserved sentinels are runtime concepts (not customer agents), so the rule ships unchanged for every
+  install. The failure case to eliminate is a handback that resolves to *nothing*; the catch-all "route
+  back to the id that queued me" guarantees it can't.
+
+**Deferred:** owner-validated / lane-based dispatch of *new* work (motivation #2) is **out of scope for
+Tier 2** — it can't be done without a per-install owner map, which is customer-specific config, not
+global runtime behavior. It belongs in a later RFC that treats the lane map as external, operator-owned
+config. Tier 2 is handback-only.
+
+### Tier 3 — Gather / join primitive
+
+**Locked orchestration taxonomy.** Work units are **mission-task** (one-shot, `mission-cli`) and
+**schedule-job** (recurring/cron, `schedule-cli`) — the CLIs are the mechanism, the units are what we
+name in doctrine. **Dispatch** is the umbrella verb: you *dispatch* a mission-task in one of three
+modes. The mode names the delivery, not the send:
+
+| Mode | Fan-out | Blocks caller | Result returns via | Shape | Mechanism |
+|---|---|---|---|---|---|
+| **delegate** | 1 → 1 | no | optional handback, later, as its own mission-task | async, non-blocking | `mission-cli create` (+ `handback`) |
+| **await** | 1 → N | yes | caller waits inline, one summary in the same turn | synchronous, blocking | orchestrator behavior (no CLI verb) |
+| **gather** | 1 → N | no | scheduler notifies on the last completion (join) | async, non-blocking (promise-like) | `mission-cli gather` |
+
+Naming rule: the blocking mode is **await** (it literally waits); **gather** is the non-blocking join;
+both are distinct from the umbrella verb *dispatch*. Defaults — delegate for 1→1, gather for fan-out,
+await only when the answer is needed inside the current turn.
+
+Tier 2 delivered **delegate** (deterministic handback). This tier delivers **gather** — the fan-out
+case Tier 2 doesn't solve. The three, side by side, and why gather is the scalable default:
+
+1. **delegate (Tier 2).** Async and scalable, but each handback fires as its **own isolated
+   mission turn** with no view of its siblings — so a fan-out of them yields N separate replies and any
+   "still outstanding" claim is an unverified guess (observed live: a later handback listing
+   already-returned siblings as pending). Right for 1→1, wrong for a fan-out.
+2. **await (manual, orchestrator).** The orchestrator fans out, then **blocks and waits** until
+   all complete, then emits one summary. Clean result, but it ties up the orchestrator's turn and *is*
+   the polling we otherwise forbid. Acceptable only as an **explicitly named** mode, never the default.
+3. **gather (this tier).** The **scheduler** — not the orchestrator — releases a single
+   aggregation turn once the last child of a group finishes. Non-blocking, no polling, one summary.
+
+**Design.**
+- **Group tag.** A fan-out is created with a shared `group_id`; children complete normally with their
+  findings as their result (**no per-child handback turn**), so nothing auto-narrates.
+- **Join mission.** One "join" mission is created for the group, assigned to the aggregating agent, but
+  parked in a new **`waiting`** status the scheduler does **not** claim.
+- **Scheduler-released.** When any child completes, the scheduler checks whether every sibling in its
+  group is terminal (`completed`/`failed`/`cancelled`); if so, it releases the join mission
+  (`waiting` → `queued`) and assembles the child results into the join prompt. The join then runs **once**
+  and produces the single consolidated summary — exactly like manual **await**, but the *system*
+  waits, not a person.
+- **Atomic last-child release (the one hard part).** Two children finishing near-simultaneously must not
+  both release (double summary) or both skip (no summary). Release is a single conditional update —
+  `UPDATE mission_tasks SET status='queued' WHERE group_id=? AND role='join' AND status='waiting'` — and
+  only the caller that sees `changes()==1` owns the release. Everything else is straightforward.
+- **Never dead-ends.** A group whose join can't attribute a destination falls back to the human-surface
+  path (same rule as Tier 2). A stuck child (timeout/failed) still counts as terminal, so the join
+  always eventually fires.
+
+Net: fan-out gather becomes a first-class, non-blocking primitive. `/gather` stays as the manual,
+zero-infrastructure fallback; the join primitive is the scalable default once it lands.
 
 ### What each agent must "know" (the whole point)
 
 - **Self:** who I am, where my config + store are, and `hive-cli` to reach my hive mind.
-- **Callback:** results go back to whoever queued me (system resolves it).
-- Nothing about the org chart. Routing lives in the CLI.
+- **Callback:** results go back to whoever queued me (the CLI resolves it from `created_by`).
+- Nothing about the org chart, and no compiled-in roster of agent names.
 
 ## Containment (scoped OUT here → next RFC, and it is a NEAR-term priority, not someday)
 
@@ -131,10 +187,14 @@ absolute path is the whole ballgame. Do not run an untrusted provider in this se
 - `scripts/setup.ts` (~L893–952) — stamp resolved config/store paths as **informational** (point to
   `hive-cli path` as canonical); **enforce placeholder replacement** (no `[YOUR NAME]`/`Michael [does
   what you do]` left in a generated config); ship/point-to `agent-common.md`.
-- `src/mission-cli.ts` — `handback` subcommand resolving `created_by` per the resolution table
-  (agent/human/dashboard/scheduled); `--lane` + owner-map validation.
-- `mission_tasks` schema — add `parent_task_id`, `lane`.
-- owner-lane map — committed config (e.g. `config/agent-lanes.json`).
+- `src/mission-cli.ts` — `handback` subcommand resolving `created_by` per the roster-free rule
+  (reserved sentinels → human; anything else → that agent id). No `--lane` / owner-map in Tier 2.
+- `mission_tasks` schema — add `parent_task_id` (Tier 2); add `group_id`, `role` ('task'|'join'), and a
+  `waiting` status (Tier 3).
+- `src/scheduler.ts` (Tier 3) — on child completion, detect group membership, atomically release the
+  group's `waiting` join mission when all siblings are terminal, and assemble child results into the join
+  prompt.
+- `src/mission-cli.ts` (Tier 3) — `gather` verbs to create a grouped fan-out plus its parked join mission.
 - `~/.claudeclaw-os/docs/agent-common.md` (and shipped copy) — replace raw sqlite with `hive-cli`.
 - sandbox launch hygiene — scrub production-pointing env (`GEMINI_CLI_IDE_WORKSPACE_PATH`, etc.) so
   they can't seed the wrong path (belongs to the containment RFC but note the vector here).
@@ -164,5 +224,8 @@ and unblocks the sandbox work).
 > every install, not just this sandbox. Tier 1 is the one I'd build first: give agents a correct,
 > store-aware accessor and tell them where they live, and the whole class of "hunt the filesystem for a
 > db" behavior disappears — which also quietly shrinks the data-egress surface before we ever layer a
-> non-Claude model on top. Tier 2 then makes the fleet's comms deterministic so autonomy scales without
-> agents needing to memorize the org chart. — Holden
+> non-Claude model on top. Tier 2 then makes handbacks deterministic — an agent only ever "replies to
+> whoever queued me," resolved by the CLI from `created_by` with a generic, roster-free rule — so
+> autonomy scales without any agent (or shipped code) carrying a fleet-specific roster. Lane-based
+> dispatch of new work is deliberately deferred: it needs a per-install owner map, which is operator
+> config, not global runtime behavior.
