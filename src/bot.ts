@@ -1327,16 +1327,18 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
       // Check user_invocable: true
       if (!/user_invocable:\s*true/i.test(fm)) continue;
 
-      // Extract name
+      // Extract name (Telegram command names: 1-32 chars, [a-z0-9_]).
+      // Clamp to 32 — an over-long name 400s the whole setMyCommands call.
       const nameMatch = fm.match(/^name:\s*(.+)$/m);
       if (!nameMatch) continue;
-      const name = nameMatch[1].trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      const name = nameMatch[1].trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 32);
       if (!name) continue;
 
-      // Extract description (truncate to 256 chars for Telegram limit)
+      // Extract description (clamp to 250; Telegram hard limit is 256, keep
+      // headroom so a single long description can't 400 the whole call).
       const descMatch = fm.match(/^description:\s*(.+)$/m);
       const desc = descMatch
-        ? descMatch[1].trim().slice(0, 256)
+        ? descMatch[1].trim().slice(0, 250)
         : `Run the ${name} skill`;
 
       commands.push({ command: name, description: desc });
@@ -1425,7 +1427,16 @@ export function createBot(): Bot {
   ];
   const skillCommands = discoverSkillCommands();
   const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
-  bot.api.setMyCommands(allCommands)
+  // Assert a clean slate: clear any non-default command scopes first. Telegram
+  // serves the MOST-SPECIFIC scope, and we only ever write the default scope.
+  // A reused token can carry a stale all_private_chats/all_group_chats scope
+  // from a prior bot (e.g. 52 foreign commands) that silently shadows ours on
+  // every client. We can't override a scope we don't set, so delete them.
+  Promise.all([
+    bot.api.deleteMyCommands({ scope: { type: 'all_private_chats' } }).catch(() => {}),
+    bot.api.deleteMyCommands({ scope: { type: 'all_group_chats' } }).catch(() => {}),
+  ])
+    .then(() => bot.api.setMyCommands(allCommands))
     .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
     .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
 

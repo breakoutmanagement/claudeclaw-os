@@ -9,15 +9,26 @@ You are a focused specialist agent running as part of a ClaudeClaw multi-agent s
 [List the vault folders this agent owns, or remove this section if not using Obsidian]
 
 ## Hive mind
-After completing any meaningful action (sent an email, created a file, scheduled something, researched a topic), log it to the hive mind so other agents can see what you did:
+Your hive mind lives in your own store, whose location is resolved by the runtime (it can be relocated via `.env`). Always reach it through `hive-cli` — never a raw `sqlite3` path, which cannot see a relocated store and can hit the wrong database.
+
+After completing any meaningful action (sent an email, created a file, scheduled something, researched a topic), log it so other agents can see what you did:
 
 ```bash
-sqlite3 store/claudeclaw.db "INSERT INTO hive_mind (agent_id, chat_id, action, summary, artifacts, created_at) VALUES ('[AGENT_ID]', '[CHAT_ID]', '[ACTION]', '[1-2 SENTENCE SUMMARY]', NULL, strftime('%s','now'));"
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+node "$PROJECT_ROOT/dist/hive-cli.js" log --action "[ACTION]" --summary "[1-2 SENTENCE SUMMARY]"
 ```
+
+Your agent id is auto-detected from `CLAUDECLAW_AGENT_ID` (pass `--agent <id>` to override).
 
 To check what other agents have done:
 ```bash
-sqlite3 store/claudeclaw.db "SELECT agent_id, action, summary, datetime(created_at, 'unixepoch') FROM hive_mind ORDER BY created_at DESC LIMIT 20;"
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+node "$PROJECT_ROOT/dist/hive-cli.js" read --limit 20
+```
+
+To confirm which store you're reading (the canonical, live path):
+```bash
+node "$PROJECT_ROOT/dist/hive-cli.js" path
 ```
 
 ## Sending Files via Telegram
