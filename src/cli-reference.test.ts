@@ -68,4 +68,12 @@ describe('renderCliIndex (prompt injection)', () => {
     expect(index).toContain('mission-cli');
     expect(index).toContain('schedule-cli');
   });
+
+  it('gives the runnable node invocation and forbids raw sqlite3 (issue #155 scope A/B)', () => {
+    // Agents were falling back to raw sqlite3 because they tried the bare command
+    // name (not on PATH). The index must show the node dist form and ban raw sqlite3.
+    expect(index).toContain('node "$PROJECT_ROOT/');
+    expect(index.toLowerCase()).toContain('raw sqlite3');
+    expect(index).toContain('dist/hive-cli.js');
+  });
 });

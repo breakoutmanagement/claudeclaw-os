@@ -2370,8 +2370,50 @@ export function getMissionTask(id: string): MissionTask | null {
   return (db.prepare('SELECT * FROM mission_tasks WHERE id = ?').get(id) as MissionTask) ?? null;
 }
 
+// Synchronous sleep (better-sqlite3 is synchronous). Uses Atomics.wait so we
+// block the thread without a busy spin.
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Bounded retry around a synchronous DB write for SQLITE_BUSY. WAL + busy_timeout
+// (db.ts init) cover most contention, but a lock UPGRADE inside a transaction can
+// still return SQLITE_BUSY immediately without honoring busy_timeout — hence both
+// the IMMEDIATE transactions below AND this retry as a backstop for pathological
+// multi-writer bursts (see issue #155).
+function withBusyRetry<T>(fn: () => T, attempts = 4): T {
+  let delay = 40;
+  for (let i = 0; ; i++) {
+    try {
+      return fn();
+    } catch (err) {
+      const code = (err as { code?: string })?.code ?? '';
+      const busy = code === 'SQLITE_BUSY' || /database is locked/i.test((err as Error)?.message ?? '');
+      if (!busy || i >= attempts - 1) throw err;
+      sleepSync(delay);
+      delay *= 2;
+    }
+  }
+}
+
 export function claimNextMissionTask(agentId: string): MissionTask | null {
+  // IMMEDIATE so the write lock is taken up front — a DEFERRED transaction takes a
+  // read lock on the SELECT then upgrades on the UPDATE, and SQLite returns
+  // SQLITE_BUSY on the upgrade WITHOUT honoring busy_timeout (issue #155).
   const txn = db.transaction(() => {
+    // One-running-per-agent guard: don't claim while this agent already has a task
+    // executing. Tasks are marked 'running' at claim/enqueue time and execution is
+    // serialized per chat by the message queue, so without this guard a later tick
+    // claims a second task and the DB briefly shows 2 'running' (1 executing + 1
+    // enqueued) — inflated concurrency (issue #155). Race-safe under the IMMEDIATE
+    // transaction below; a stuck 'running' can't wedge the agent because
+    // TASK_TIMEOUT_MS aborts+completes and resetStuckMissionTasks clears on boot.
+    const running = db
+      .prepare(
+        `SELECT 1 FROM mission_tasks WHERE assigned_agent = ? AND status = 'running' LIMIT 1`,
+      )
+      .get(agentId);
+    if (running) return null;
     const task = db
       .prepare(
         `SELECT * FROM mission_tasks
@@ -2381,12 +2423,13 @@ export function claimNextMissionTask(agentId: string): MissionTask | null {
       )
       .get(agentId) as MissionTask | undefined;
     if (!task) return null;
+    const startedAt = Math.floor(Date.now() / 1000);
     db.prepare(
       `UPDATE mission_tasks SET status = 'running', started_at = ? WHERE id = ?`,
-    ).run(Math.floor(Date.now() / 1000), task.id);
-    return { ...task, status: 'running' as const, started_at: Math.floor(Date.now() / 1000) };
+    ).run(startedAt, task.id);
+    return { ...task, status: 'running' as const, started_at: startedAt };
   });
-  return txn();
+  return withBusyRetry(() => txn.immediate());
 }
 
 export function completeMissionTask(
@@ -2396,9 +2439,15 @@ export function completeMissionTask(
   error?: string,
 ): void {
   const now = Math.floor(Date.now() / 1000);
-  db.prepare(
-    `UPDATE mission_tasks SET status = ?, result = ?, error = ?, completed_at = ? WHERE id = ?`,
-  ).run(status, result, error ?? null, now, id);
+  // Retry so a completion write never loses the lock race and leaves the task
+  // stuck in 'running' with no completed_at (issue #155).
+  withBusyRetry(() =>
+    db
+      .prepare(
+        `UPDATE mission_tasks SET status = ?, result = ?, error = ?, completed_at = ? WHERE id = ?`,
+      )
+      .run(status, result, error ?? null, now, id),
+  );
 }
 
 export function cancelMissionTask(id: string): boolean {

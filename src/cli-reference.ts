@@ -157,10 +157,16 @@ export function renderCliIndex(descriptors: CliDescriptor[]): string {
       'schedule-cli — never fake a one-shot with a far-future cron.',
   );
   lines.push('');
+  lines.push(
+    'Run each as `node "$PROJECT_ROOT/<binary>"` (resolve $PROJECT_ROOT with ' +
+      '`git rev-parse --show-toplevel`); these are NOT bare-PATH commands. Never read ' +
+      'or write the store with raw sqlite3 — always go through hive-cli.',
+  );
+  lines.push('');
   lines.push('Full usage: docs/agent-cli-reference.md');
   lines.push('');
   for (const d of shipped) {
-    lines.push(`- \`${d.name}\` — ${d.summary}`);
+    lines.push(`- \`${d.name}\` (\`${d.binary}\`) — ${d.summary}`);
   }
 
   return lines.join('\n');
