@@ -28,6 +28,8 @@ import {
   logToHiveMind,
   getHiveMindEntries,
 } from './db.js';
+import { renderHelp } from './cli-reference.js';
+import { hiveDescriptor as descriptor } from './cli-descriptors.js';
 
 // Canonical DB path — derived from config.ts's STORE_DIR (which honors the
 // .env-based CLAUDECLAW_STORE_DIR pin), NOT from process.env directly.
@@ -44,6 +46,11 @@ function formatDate(unix: number | null): string {
     month: 'short', day: 'numeric',
     hour: 'numeric', minute: '2-digit', hour12: true,
   });
+}
+
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(renderHelp(descriptor));
+  process.exit(0);
 }
 
 const command = process.argv[2];

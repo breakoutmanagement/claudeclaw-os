@@ -16,6 +16,8 @@
     "test:e2e": "playwright test",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "gen:cli-docs": "tsx scripts/gen-cli-reference.ts",
+    "gen:cli-docs:check": "tsx scripts/gen-cli-reference.ts --check",
     "migrate": "tsx scripts/migrate.ts",
     "setup": "tsx scripts/setup.ts",
     "provider:setup": "tsx scripts/provider-setup.ts",

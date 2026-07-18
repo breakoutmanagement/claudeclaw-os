@@ -17,6 +17,7 @@
  */
 
 import { randomBytes } from 'crypto';
+import { pathToFileURL } from 'url';
 
 import {
   initDatabase,
@@ -29,7 +30,22 @@ import {
   resolveHandbackDestination,
   MAIN_AGENT_ID,
 } from './routing.js';
+import { renderHelp } from './cli-reference.js';
+import { missionDescriptor as descriptor } from './cli-descriptors.js';
 
+// Only run the CLI when invoked directly, so importing `descriptor` (for docs
+// generation and the drift-guard test) does not trigger DB init or arg parsing.
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log(renderHelp(descriptor));
+    process.exit(0);
+  }
+  runCli();
+}
+
+function runCli(): void {
 initDatabase();
 
 // Parse --agent flag (null = unassigned, use auto-assign on dashboard)
@@ -254,4 +270,5 @@ switch (command) {
   default:
     console.error('Commands: create | handback | list | result | cancel | gather');
     process.exit(1);
+}
 }
