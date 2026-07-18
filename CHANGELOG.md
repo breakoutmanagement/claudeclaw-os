@@ -5,6 +5,16 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.5.1] - 2026-07-18
+
+### Bug Fixes
+
+- End SQLITE_BUSY starvation + normalize CLI invocation (Closes #155) ([#156](https://github.com/earlyaidopters/claudeclaw-os/pull/156))
+
+### Features
+
+- CLI-awareness descriptor registry + generated reference + prompt-injected index ([#153](https://github.com/earlyaidopters/claudeclaw-os/pull/153))
+
 ## [1.5.0] - 2026-07-17
 
 ### Bug Fixes
