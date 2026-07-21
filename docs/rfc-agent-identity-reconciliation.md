@@ -1,7 +1,7 @@
 ---
 Author: Michael Kidder
 Title: Agent Identity Reconciliation
-Status: Draft (plan-first, no code yet)
+Status: Accepted (2026-07-17)
 Created: 2026-07-08
 Component: agent identity / name-to-id routing
 ---

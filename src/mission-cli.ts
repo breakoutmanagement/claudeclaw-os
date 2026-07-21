@@ -32,6 +32,7 @@ import {
 } from './routing.js';
 import { renderHelp } from './cli-reference.js';
 import { missionDescriptor as descriptor } from './cli-descriptors.js';
+import { resolveAgentOrExit } from './resolve-agent.js';
 
 // Only run the CLI when invoked directly, so importing `descriptor` (for docs
 // generation and the drift-guard test) does not trigger DB init or arg parsing.
@@ -124,13 +125,16 @@ switch (command) {
       console.error('Usage: mission-cli create --agent <id> --title "Label" "Full prompt text"');
       process.exit(1);
     }
+    // Resolve display-name/alias -> canonical id, or exit non-zero writing
+    // nothing. Omitted --agent stays unassigned (dashboard auto-assigns).
+    const resolvedAgent = targetAgent !== null ? resolveAgentOrExit(targetAgent) : null;
     const title = titleArg || prompt.slice(0, 60);
     const id = randomBytes(4).toString('hex');
-    createMissionTask(id, title, prompt, targetAgent ?? null, createdBy, priorityArg);
+    createMissionTask(id, title, prompt, resolvedAgent, createdBy, priorityArg);
 
     console.log(`Mission task created: ${id}`);
     console.log(`  Title:    ${title}`);
-    console.log(`  Agent:    ${targetAgent || 'unassigned (use dashboard to assign)'}`);
+    console.log(`  Agent:    ${resolvedAgent || 'unassigned (use dashboard to assign)'}`);
     console.log(`  Priority: ${priorityArg}`);
     console.log(`  Prompt:   ${prompt.slice(0, 100)}${prompt.length > 100 ? '...' : ''}`);
     break;
@@ -237,33 +241,41 @@ switch (command) {
     const title = titleArg || 'Gather';
     const joinPrompt = rest[0] || 'All grouped tasks are complete. Produce ONE consolidated summary of the collected results below.';
 
-    const childIds: string[] = [];
-    for (const taskArg of taskArgs) {
+    // Parse + resolve every agent reference BEFORE writing any row, so an
+    // unknown agent aborts the whole gather without leaving partial children.
+    const children = taskArgs.map((taskArg) => {
       const sepIdx = taskArg.indexOf(':');
       if (sepIdx === -1) {
         console.error(`Invalid --task value (expected "agent:prompt"): ${taskArg}`);
         process.exit(1);
       }
-      const childAgent = taskArg.slice(0, sepIdx);
-      const childPrompt = taskArg.slice(sepIdx + 1);
+      return {
+        agent: resolveAgentOrExit(taskArg.slice(0, sepIdx)),
+        prompt: taskArg.slice(sepIdx + 1),
+      };
+    });
+    const resolvedSummaryAgent = resolveAgentOrExit(summaryAgentArg);
+
+    const childIds: string[] = [];
+    for (const child of children) {
       const childId = randomBytes(4).toString('hex');
-      const childTitle = `${title} (${childAgent})`.slice(0, 80);
+      const childTitle = `${title} (${child.agent})`.slice(0, 80);
       const body = [
-        childPrompt,
+        child.prompt,
         '',
         'Complete this mission with your findings as your final output. Do NOT fire a handback.',
       ].join('\n');
-      createMissionTask(childId, childTitle, body, childAgent, createdBy, priorityArg, null, groupId, 'task');
+      createMissionTask(childId, childTitle, body, child.agent, createdBy, priorityArg, null, groupId, 'task');
       childIds.push(childId);
     }
 
     const joinId = randomBytes(4).toString('hex');
     const joinTitle = `${title} (join)`.slice(0, 80);
-    createMissionTask(joinId, joinTitle, joinPrompt, summaryAgentArg, createdBy, priorityArg, null, groupId, 'join', 'waiting');
+    createMissionTask(joinId, joinTitle, joinPrompt, resolvedSummaryAgent, createdBy, priorityArg, null, groupId, 'join', 'waiting');
 
     console.log(`Gather group created: ${groupId}`);
     console.log(`  Children: ${childIds.join(', ')}`);
-    console.log(`  Join (parked, waiting): ${joinId} -> @${summaryAgentArg}`);
+    console.log(`  Join (parked, waiting): ${joinId} -> @${resolvedSummaryAgent}`);
     break;
   }
 

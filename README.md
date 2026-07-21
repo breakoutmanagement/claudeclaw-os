@@ -266,6 +266,14 @@ npm run build          # recompile TypeScript
 
 Then restart the bot (Ctrl+C and `npm start`, or restart the background service).
 
+**Self-healing on first start.** Older installs stored the main bot's config in a
+few scattered places (`store/main-config.json`, a persona at the config-dir root).
+On the first start after upgrading, ClaudeClaw automatically migrates `main` into
+the standard per-agent layout — `agents/main/agent.yaml` and
+`agents/main/CLAUDE.md` — folding the old `main-config.json` into the yaml and
+retiring it to `main-config.json.bak`. It's idempotent and never overwrites edits
+you've made, so there's nothing for you to do.
+
 **Restart every agent, not just the main bot.** If you run multiple agents, each one is its own long-lived process. A rebuild does **not** touch already-running agents — they keep executing the old pre-upgrade code and will typically start returning "Something went wrong" until restarted. After `npm run build`, restart **all** agent processes so they pick up the new build (see [Restart ALL agents after a rebuild](#step-4-start-your-agents), or re-run the install script which rebuilds and restarts everything).
 
 **Auth token may have expired.** If `git pull` fails to fetch, your stored access token may have lapsed since your last update. Refresh it and pull again — an expired token is the most common cause of a fetch that suddenly stops working after months on the same version.
@@ -316,6 +324,17 @@ If your platform refuses to run the bot at all (binary missing, npm install fail
 ## How it works
 
 ![ClaudeClaw architecture](assets/architecture.png)
+
+### Agent identity: id, display name, and aliases
+
+Each agent has a permanent **canonical id** (`main`, `naomi`, …), a **display
+name** you can change any time (`Holden`, `Nova`, …), and an append-only list of
+**aliases** — former display names kept automatically on rename. You can address
+an agent by **any of the three**: the CLIs and dashboard resolve whatever you
+pass to the canonical id before doing anything with it. An unknown name fails
+loudly with the list of known agents instead of silently going nowhere, and a
+rename never orphans an old reference. Full details in
+[docs/agent-common.md](docs/agent-common.md).
 
 ## What's included
 

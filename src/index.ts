@@ -7,7 +7,7 @@ import path from 'path';
 
 import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd, resolveInstructionMd, refreshWarRoomRoster } from './agent-config.js';
 import { createBot } from './bot.js';
-import { checkPendingMigrations } from './migrations.js';
+import { checkPendingMigrations, backfillMainAgent } from './migrations.js';
 import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
@@ -141,6 +141,18 @@ async function main(): Promise<void> {
     // without this the file wouldn't exist and reads/writes fell through to
     // PROJECT_ROOT — the virgin state behind #146/#148. Idempotent.
     ensureMainAgentConfig();
+    // Self-heal a pre-scaffolding install's main layout into the standard
+    // per-agent shape: fold the legacy store/main-config.json into
+    // agents/main/agent.yaml, retire it to .bak, and copy a legacy persona
+    // into agents/main/CLAUDE.md. Idempotent; never overwrites user edits.
+    // Wrapped so a backfill failure logs and continues boot (a broken
+    // migration must not block the hub from starting).
+    try {
+      const { changed } = backfillMainAgent({ configDir: CLAUDECLAW_CONFIG, storeDir: STORE_DIR, projectRoot: PROJECT_ROOT });
+      if (changed.length > 0) logger.info({ changed }, 'main-agent backfill applied');
+    } catch (err) {
+      logger.warn({ err: err instanceof Error ? err.message : err }, 'main-agent backfill failed (continuing boot)');
+    }
   }
 
   if (!activeBotToken) {

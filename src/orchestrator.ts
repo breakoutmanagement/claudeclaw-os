@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { runAgent, UsageInfo } from './agent.js';
-import { loadAgentConfig, listAgentIds, resolveAgentClaudeMd } from './agent-config.js';
+import { loadAgentConfig, listAgentIds, resolveAgentClaudeMd, resolveAgentId } from './agent-config.js';
 import { PROJECT_ROOT } from './config.js';
 import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './db.js';
 import { logger } from './logger.js';
@@ -142,12 +142,18 @@ export async function delegateToAgent(
   onProgress?: (msg: string) => void,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<DelegationResult> {
-  let agent = agentRegistry.find((a) => a.id === agentId);
+  // Resolve a display-name/alias to the canonical id up front so the registry
+  // lookup, DB row, and hive-mind log all key off the id (not a name that would
+  // dead-letter). Fall back to the raw input so the existing not-found error
+  // still fires for a genuinely unknown agent.
+  const canonicalId = resolveAgentId(agentId) ?? agentId;
+
+  let agent = agentRegistry.find((a) => a.id === canonicalId);
   if (!agent) {
     // Cache miss: an agent created via the dashboard wizard after this
     // process started won't be in the cache yet. Refresh once and retry.
     rebuildRegistry();
-    agent = agentRegistry.find((a) => a.id === agentId);
+    agent = agentRegistry.find((a) => a.id === canonicalId);
   }
   if (!agent) {
     const available = agentRegistry.map((a) => a.id).join(', ') || '(none)';
@@ -160,20 +166,20 @@ export async function delegateToAgent(
   const start = Date.now();
 
   // Record the task
-  createInterAgentTask(taskId, fromAgent, agentId, chatId, prompt);
+  createInterAgentTask(taskId, fromAgent, canonicalId, chatId, prompt);
   logToHiveMind(
     fromAgent,
     chatId,
     'delegate',
-    `Delegated to ${agentId}: ${prompt.slice(0, 100)}`,
+    `Delegated to ${canonicalId}: ${prompt.slice(0, 100)}`,
   );
 
   onProgress?.(`Delegating to ${agent.name}...`);
 
   try {
     // Load agent config to get its system prompt and MCP allowlist
-    const agentConfig = loadAgentConfig(agentId);
-    const claudeMdPath = resolveAgentClaudeMd(agentId);
+    const agentConfig = loadAgentConfig(canonicalId);
+    const claudeMdPath = resolveAgentClaudeMd(canonicalId);
     let systemPrompt = '';
     if (claudeMdPath) {
       try {
@@ -184,7 +190,7 @@ export async function delegateToAgent(
     }
 
     // Build memory context for the delegated agent
-    const { contextText: memCtx } = await buildMemoryContext(chatId, prompt, agentId);
+    const { contextText: memCtx } = await buildMemoryContext(chatId, prompt, canonicalId);
 
     // Build the delegated prompt with agent role context + memory
     const contextParts: string[] = [];
@@ -226,7 +232,7 @@ export async function delegateToAgent(
       const durationMs = Date.now() - start;
       completeInterAgentTask(taskId, 'completed', result.text);
       logToHiveMind(
-        agentId,
+        canonicalId,
         chatId,
         'delegate_result',
         `Completed delegation from ${fromAgent}: ${(result.text ?? '').slice(0, 120)}`,
@@ -237,7 +243,7 @@ export async function delegateToAgent(
       );
 
       return {
-        agentId,
+        agentId: canonicalId,
         text: result.text,
         usage: result.usage,
         taskId,
@@ -252,7 +258,7 @@ export async function delegateToAgent(
     const errMsg = err instanceof Error ? err.message : String(err);
     completeInterAgentTask(taskId, 'failed', errMsg);
     logToHiveMind(
-      agentId,
+      canonicalId,
       chatId,
       'delegate_error',
       `Delegation from ${fromAgent} failed: ${errMsg.slice(0, 120)}`,

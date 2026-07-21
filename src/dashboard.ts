@@ -76,6 +76,9 @@ import {
   AGENT_ID_RE,
   agentExists,
   listAgentIds,
+  resolveAgentId,
+  knownAgentIds,
+  findAgentIdentityCollision,
   loadAgentConfig,
   resolveAgentDir,
   resolveAgentDisplayName,
@@ -377,7 +380,6 @@ function validateProviderConfig(provider: ProviderConfig): string | null {
 
 async function classifyTaskAgent(prompt: string): Promise<string | null> {
   const agentIds = listAgentIds();
-  const validAgents = ['main', ...agentIds];
   const agentDescriptions = agentIds.map((id) => {
     try {
       const config = loadAgentConfig(id);
@@ -399,7 +401,8 @@ Reply with JSON: {"agent": "agent_id"}`;
   try {
     const raw = await extractViaProvider(classificationPrompt);
     const parsed = parseJsonResponse<{ agent: string }>(raw);
-    if (parsed?.agent && validAgents.includes(parsed.agent)) return parsed.agent;
+    const resolved = parsed?.agent ? resolveAgentId(parsed.agent) : null;
+    if (resolved) return resolved;
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err }, 'selected-provider classify failed, falling back to Gemini');
   }
@@ -409,7 +412,8 @@ Reply with JSON: {"agent": "agent_id"}`;
   try {
     const response = await generateContent(classificationPrompt);
     const parsed = parseJsonResponse<{ agent: string }>(response);
-    if (parsed?.agent && validAgents.includes(parsed.agent)) return parsed.agent;
+    const resolved = parsed?.agent ? resolveAgentId(parsed.agent) : null;
+    if (resolved) return resolved;
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err }, 'Gemini classify failed, defaulting to main');
   }
@@ -1907,17 +1911,19 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
 
     const title = body?.title?.trim();
     const prompt = body?.prompt?.trim();
-    const assignedAgent = body?.assigned_agent?.trim() || null;
+    const rawAgent = body?.assigned_agent?.trim() || null;
     const priority = Math.max(0, Math.min(10, body?.priority ?? 0));
 
     if (!title || title.length > 200) return c.json({ error: 'title required (max 200 chars)' }, 400);
     if (!prompt || prompt.length > 10000) return c.json({ error: 'prompt required (max 10000 chars)' }, 400);
 
-    // Validate agent if provided
-    if (assignedAgent) {
-      const validAgents = ['main', ...listAgentIds()];
-      if (!validAgents.includes(assignedAgent)) {
-        return c.json({ error: `Unknown agent: ${assignedAgent}. Valid: ${validAgents.join(', ')}` }, 400);
+    // Resolve display-name/alias -> canonical id, or 4xx. Only the canonical
+    // id is ever stored so a poller's `WHERE assigned_agent = ?` always matches.
+    let assignedAgent: string | null = null;
+    if (rawAgent) {
+      assignedAgent = resolveAgentId(rawAgent);
+      if (!assignedAgent) {
+        return c.json({ error: `Unknown agent: ${rawAgent}. Known: ${knownAgentIds().join(', ')}` }, 400);
       }
     }
 
@@ -1975,9 +1981,11 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     const body = await c.req.json<{ assigned_agent?: string }>();
     const newAgent = body?.assigned_agent?.trim();
     if (!newAgent) return c.json({ error: 'assigned_agent required' }, 400);
-    const validAgents = ['main', ...listAgentIds()];
-    if (!validAgents.includes(newAgent)) return c.json({ error: 'Unknown agent' }, 400);
-    const ok = reassignMissionTask(id, newAgent);
+    const resolvedAgent = resolveAgentId(newAgent);
+    if (!resolvedAgent) {
+      return c.json({ error: `Unknown agent: ${newAgent}. Known: ${knownAgentIds().join(', ')}` }, 400);
+    }
+    const ok = reassignMissionTask(id, resolvedAgent);
     return c.json({ ok });
   });
 
@@ -2286,7 +2294,9 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
         return {
           id,
           name: config.name || resolveAgentDisplayName(id),
-          description: id === 'main' ? getMainDescription() : config.description,
+          // main is normalized — its description comes from agents/main/agent.yaml
+          // (config.description) like every other agent, not a special store.
+          description: config.description,
           model,
           provider: reportedProvider,
           running,
@@ -2667,37 +2677,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     return { claudeMd, agentYaml, agentYamlRedacted };
   }
 
-  // Main is the host process — it has no agents/main/ directory and no
-  // agent.yaml (its config lives in .env). Its CLAUDE.md is loaded from
-  // CLAUDECLAW_CONFIG/CLAUDE.md (preferred) or PROJECT_ROOT/CLAUDE.md
-  // (legacy fallback). The editor exposes only the persona for main.
-  function resolveMainClaudeMdPath(): string {
-    const external = path.join(CLAUDECLAW_CONFIG, 'CLAUDE.md');
-    if (fs.existsSync(external)) return external;
-    const repo = path.join(PROJECT_ROOT, 'CLAUDE.md');
-    if (fs.existsSync(repo)) return repo;
-    // Neither exists — write goes to the external path (the canonical
-    // location). Read returns empty.
-    return external;
-  }
-
+  // Disk + runtime already normalized `main` into the standard per-agent
+  // shape: agents/main/agent.yaml (full config) and agents/main/CLAUDE.md
+  // (persona the runtime reads from cwd). So main uses the same read/write
+  // path as every other agent — no special-casing, no hidden Config tab, and
+  // persona edits land where the runtime actually reads them.
   app.get('/api/agents/:id/files', (c) => {
     const agentId = c.req.param('id');
     if (!/^[a-z0-9_-]+$/i.test(agentId)) return c.json({ error: 'invalid id' }, 400);
-
-    if (agentId === 'main') {
-      const mainClaude = resolveMainClaudeMdPath();
-      const claudeMd = fs.existsSync(mainClaude) ? fs.readFileSync(mainClaude, 'utf-8') : '';
-      return c.json({
-        agent_id: 'main',
-        claude_md: claudeMd,
-        agent_yaml: '',
-        bot_token_redacted: false,
-        // Tells the UI to hide the Config tab — main has no agent.yaml.
-        config_editable: false,
-        claude_md_path: mainClaude,
-      });
-    }
 
     let agentDir: string;
     try { agentDir = resolveAgentDir(agentId); }
@@ -2723,21 +2710,16 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       return c.json({ error: 'CLAUDE.md exceeds 200KB' }, 400);
     }
 
-    // Resolve target path — main's CLAUDE.md lives outside the agents/
-    // tree. For sub-agents, the file goes into the agent's resolved dir
-    // (which respects CLAUDECLAW_CONFIG override).
-    let target: string;
-    if (agentId === 'main') {
-      target = resolveMainClaudeMdPath();
-      // Make sure the parent dir exists — fresh installs may not have
-      // created CLAUDECLAW_CONFIG yet.
-      try { fs.mkdirSync(path.dirname(target), { recursive: true }); } catch {}
-    } else {
-      let agentDir: string;
-      try { agentDir = resolveAgentDir(agentId); }
-      catch { return c.json({ error: 'agent not found' }, 404); }
-      target = path.join(agentDir, 'CLAUDE.md');
-    }
+    // Every agent — main included — stores its persona at
+    // <agentDir>/CLAUDE.md, which is exactly where the runtime reads it from
+    // cwd. (Previously main wrote to CLAUDECLAW_CONFIG/CLAUDE.md, a path the
+    // runtime never reads, so a persona edit silently never reached the bot.)
+    let agentDir: string;
+    try { agentDir = resolveAgentDir(agentId); }
+    catch { return c.json({ error: 'agent not found' }, 404); }
+    const target = path.join(agentDir, 'CLAUDE.md');
+    // Fresh installs may not have created the agent dir yet.
+    try { fs.mkdirSync(path.dirname(target), { recursive: true }); } catch {}
     try {
       snapshotPriorVersion(agentId, 'claudemd', target);
       const atomicEnvWrite = await getAtomicWriter();
@@ -2771,10 +2753,8 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
   app.put('/api/agents/:id/files/agent-yaml', async (c) => {
     const agentId = c.req.param('id');
     if (!/^[a-z0-9_-]+$/i.test(agentId)) return c.json({ error: 'invalid id' }, 400);
-    if (agentId === 'main') {
-      // Main is the host process — its config lives in .env, not yaml.
-      return c.json({ error: 'main agent has no agent.yaml; edit .env directly' }, 400);
-    }
+    // `main` is normalized to the standard per-agent shape (agents/main/
+    // agent.yaml), so it saves through the same path as every other agent.
     const body = await c.req.json().catch(() => null) as { content?: string } | null;
     if (!body || typeof body.content !== 'string') {
       return c.json({ error: 'expected { content: string }' }, 400);
@@ -2787,10 +2767,10 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     catch { return c.json({ error: 'agent not found' }, 404); }
 
     // Validate as YAML before writing — no point poisoning the file.
+    const yamlMod = await import('js-yaml');
     let parsed: any;
     try {
-      const yaml = await import('js-yaml');
-      parsed = yaml.load(body.content);
+      parsed = yamlMod.load(body.content);
     } catch (err: any) {
       return c.json({ error: 'YAML parse error: ' + (err?.message || err) }, 400);
     }
@@ -2806,18 +2786,63 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
       return c.json({ error: 'agent.yaml requires name and telegram_bot_token_env fields' }, 400);
     }
 
+    // Uniqueness guard: the new display name (and any aliases) must not collide
+    // with another agent's id, display name, or alias. Keeps the namespaces
+    // from ever overlapping so resolveAgentId is never ambiguous.
+    const nameCollision = findAgentIdentityCollision(String(parsed.name), { ignoreAgentId: agentId });
+    if (nameCollision) {
+      return c.json({ error: `Display name "${parsed.name}" collides with the ${nameCollision.kind} "${nameCollision.value}" of agent "${nameCollision.agentId}"` }, 409);
+    }
+    const incomingAliases: string[] = Array.isArray(parsed.aliases)
+      ? parsed.aliases.filter((a: unknown): a is string => typeof a === 'string')
+      : [];
+    for (const alias of incomingAliases) {
+      const aliasCollision = findAgentIdentityCollision(alias, { ignoreAgentId: agentId });
+      if (aliasCollision) {
+        return c.json({ error: `Alias "${alias}" collides with the ${aliasCollision.kind} "${aliasCollision.value}" of agent "${aliasCollision.agentId}"` }, 409);
+      }
+    }
+
+    const yamlPath = path.join(agentDir, 'agent.yaml');
+
+    // Rename-append: if the display name changed, retain the outgoing name as
+    // an alias so historical references (--agent <oldName>) keep resolving to
+    // this canonical id forever.
+    let outgoingName: string | undefined;
+    try {
+      if (fs.existsSync(yamlPath)) {
+        const onDiskYaml = yamlMod.load(fs.readFileSync(yamlPath, 'utf-8')) as Record<string, unknown> | null;
+        if (typeof onDiskYaml?.['name'] === 'string') outgoingName = onDiskYaml['name'] as string;
+      }
+    } catch { /* unreadable on-disk yaml — treat as no prior name */ }
+    const renamed = !!outgoingName
+      && outgoingName.trim().toLowerCase() !== String(parsed.name).trim().toLowerCase();
+
     // If the client posted back the redacted token, splice in the real
     // value from the file currently on disk. Means partial edits don't
     // require the user to know the real token.
     let content = body.content;
     if (/bot_token\s*:\s*"?\*\*\*REDACTED\*\*\*"?/.test(content)) {
-      const yamlPath = path.join(agentDir, 'agent.yaml');
       const onDisk = fs.existsSync(yamlPath) ? fs.readFileSync(yamlPath, 'utf-8') : '';
       const tokenMatch = onDisk.match(/^\s*bot_token\s*:\s*([^\n#]+?)\s*(?:#.*)?$/m);
       const realToken = tokenMatch ? tokenMatch[1] : '';
       if (realToken && realToken !== '"***REDACTED***"') {
         content = content.replace(/^(\s*bot_token\s*:\s*)"?\*\*\*REDACTED\*\*\*"?(\s*(?:#.*)?)$/m, `$1${realToken}$2`);
+        // Keep the parsed object in sync for the rename re-serialization below.
+        if (typeof parsed.bot_token === 'string') parsed.bot_token = realToken.replace(/^"|"$/g, '');
       }
+    }
+
+    if (renamed) {
+      const mergedAliases = [...incomingAliases];
+      if (!mergedAliases.some((a) => a.trim().toLowerCase() === outgoingName!.trim().toLowerCase())) {
+        mergedAliases.push(outgoingName!);
+      }
+      parsed.aliases = mergedAliases;
+      // Re-serialize from the parsed object so the appended alias persists.
+      // (agent.yaml is machine-managed; setAgentModel/Provider/Description
+      // already round-trip it through yaml.dump the same way.)
+      content = yamlMod.dump(parsed, { lineWidth: -1 });
     }
 
     const target = path.join(agentDir, 'agent.yaml');
@@ -2875,17 +2900,14 @@ export function buildDashboardApp(botApi?: Api<RawApi>): Hono {
     if (!row || row.agent_id !== agentId) return c.json({ error: 'version not found' }, 404);
 
     // Resolve target path with the same rules the GET/PUT endpoints use.
-    let target: string;
-    if (agentId === 'main') {
-      if (row.file_kind !== 'claudemd') return c.json({ error: 'main has no agent.yaml' }, 400);
-      target = resolveMainClaudeMdPath();
-      try { fs.mkdirSync(path.dirname(target), { recursive: true }); } catch {}
-    } else {
-      let agentDir: string;
-      try { agentDir = resolveAgentDir(agentId); }
-      catch { return c.json({ error: 'agent not found' }, 404); }
-      target = path.join(agentDir, row.file_kind === 'claudemd' ? 'CLAUDE.md' : 'agent.yaml');
-    }
+    // main is normalized to the standard per-agent shape, so it restores
+    // through the same path as every other agent (both CLAUDE.md and
+    // agent.yaml).
+    let agentDir: string;
+    try { agentDir = resolveAgentDir(agentId); }
+    catch { return c.json({ error: 'agent not found' }, 404); }
+    const target = path.join(agentDir, row.file_kind === 'claudemd' ? 'CLAUDE.md' : 'agent.yaml');
+    try { fs.mkdirSync(path.dirname(target), { recursive: true }); } catch {}
 
     try {
       snapshotPriorVersion(agentId, row.file_kind as AgentFileKind, target);
