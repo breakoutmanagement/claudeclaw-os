@@ -8,7 +8,6 @@ import { PROJECT_ROOT } from './config.js';
 import { logToHiveMind, createInterAgentTask, completeInterAgentTask } from './db.js';
 import { logger } from './logger.js';
 import { buildMemoryContext } from './memory.js';
-import { getSelectedProviderConfig } from './active-provider.js';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -224,7 +223,13 @@ export async function delegateToAgent(
         abortCtrl,
         undefined, // no streaming for delegation
         agentConfig.mcpServers,
-        getSelectedProviderConfig(),
+        // Honour the target agent's `provider:` field from agent.yaml —
+        // same reasoning as `agentConfig.model` above. delegateToAgent runs
+        // in-process inside the orchestrator (main), so getSelectedProviderConfig()
+        // would resolve to the CALLER's/main's provider, silently running the
+        // target's model id on the wrong engine once a second provider ships.
+        // Pull the provider from the target's own config instead.
+        agentConfig.provider,
       );
 
       clearTimeout(timer);
