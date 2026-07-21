@@ -5,6 +5,12 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.6.0] - 2026-07-21
+
+### Features
+
+- Reconcile agent id/display-name/alias routing ([#154](https://github.com/earlyaidopters/claudeclaw-os/pull/154))
+
 ## [1.5.1] - 2026-07-18
 
 ### Bug Fixes
