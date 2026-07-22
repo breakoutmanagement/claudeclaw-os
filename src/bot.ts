@@ -305,6 +305,103 @@ export function formatForTelegram(text: string): string {
 }
 
 /**
+ * Convert Markdown to plain text suitable for Signal.
+ *
+ * Signal does not render Markdown or HTML — Telegram's <b>/<i> tags would
+ * appear as literal characters. Strip the syntax, keep the structure
+ * (headings on their own line, code blocks indented, links inline as
+ * "text (url)"). Used by signal-bot.ts and the scheduler when
+ * MESSENGER_TYPE=signal.
+ */
+export function formatForSignal(text: string): string {
+  // 1. Protect fenced code blocks (we strip the fence, keep the content)
+  const codeBlocks: string[] = [];
+  let result = text.replace(/```(?:\w*\n)?([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code.trim());
+    return `\x00CB${codeBlocks.length - 1}\x00`;
+  });
+
+  // 2. Protect inline code
+  const inlineCodes: string[] = [];
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return `\x00IC${inlineCodes.length - 1}\x00`;
+  });
+
+  // 3. Headings → plain line (drop the # prefix)
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, '$1');
+
+  // 4. Horizontal rules → drop
+  result = result.replace(/\n*^[-*_]{3,}$\n*/gm, '\n');
+
+  // 5. Checkboxes
+  result = result.replace(/^(\s*)-\s+\[x\]\s*/gim, '$1✓ ');
+  result = result.replace(/^(\s*)-\s+\[\s\]\s*/gm, '$1☐ ');
+
+  // 5b. Markdown bullet lists (- / *) → a clean "•" bullet. Signal renders no
+  // list markup, and a bare "-" reads worse on a phone than "•". Runs after
+  // checkboxes (so ✓/☐ lines are already converted) and before the italic pass
+  // (so a leading "* item" isn't mistaken for emphasis).
+  result = result.replace(/^(\s*)[-*]\s+/gm, '$1• ');
+
+  // 6. Bold **x** and __x__ → x
+  result = result.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  result = result.replace(/__([^_\n]+)__/g, '$1');
+
+  // 7. Italic *x* and _x_ → x
+  result = result.replace(/\*([^*\n]+)\*/g, '$1');
+  result = result.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, '$1');
+
+  // 8. Strikethrough ~~x~~ → x
+  result = result.replace(/~~([^~\n]+)~~/g, '$1');
+
+  // 9. Links [text](url) → "text (url)"
+  result = result.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1 ($2)');
+
+  // 10. Restore code blocks (no fences, just plain text)
+  result = result.replace(/\x00CB(\d+)\x00/g, (_, i) => '\n' + codeBlocks[parseInt(i)] + '\n');
+  result = result.replace(/\x00IC(\d+)\x00/g, (_, i) => inlineCodes[parseInt(i)]);
+
+  // 11. Clean up HTML that snuck through. The LLM sometimes emits HTML directly,
+  // or the scheduler/oauth-health path pre-formats for Telegram (which builds
+  // <a href>, <b>, <pre> …) and that reaches a Signal recipient — where it would
+  // render as literal characters. Keep the content and, for links, the URL.
+  //
+  // 11a. <a href="url">text</a> → "text (url)" (mirrors the Markdown-link rule
+  //      above; otherwise the whole tag renders literally).
+  result = result.replace(
+    /<a\b[^>]*?href=["']?(https?:\/\/[^"'>\s]+)["']?[^>]*>([\s\S]*?)<\/a>/gi,
+    '$2 ($1)',
+  );
+  // 11b. Structural tags that carry a line break: <br> and <li> become real
+  //      newlines / bullets so lists and multi-line HTML stay readable.
+  result = result.replace(/<br\s*\/?>/gi, '\n');
+  result = result.replace(/<li\b[^>]*>/gi, '\n• ');
+  // 11c. Strip the remaining known formatting/structural tags but keep their
+  //      content. Whitelist (not a blanket /<[^>]*>/) so literal comparison
+  //      operators ("a < b > c") are never mistaken for tags.
+  result = result.replace(
+    /<\/?(?:a|b|i|u|s|strong|em|del|code|pre|kbd|tg-spoiler|br|p|div|span|ul|ol|li|blockquote|h[1-6]|hr|table|thead|tbody|tr|td|th)\b[^>]*>/gi,
+    '',
+  );
+  // 11d. Strip ANSI colour/CSI escape sequences and stray control chars that
+  //      leak in from raw terminal/tool output. Keeps \n and \t; drops \r.
+  result = result.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  result = result.replace(/[\x00-\x08\x0B-\x1F]/g, '');
+  result = result
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  // 12. Collapse 3+ blank lines down to 2
+  result = result.replace(/\n{3,}/g, '\n\n');
+
+  return result.trim();
+}
+
+/**
  * Split a long response into Telegram-safe chunks (4096 chars).
  * Splits on newlines where possible to avoid breaking mid-sentence.
  */
