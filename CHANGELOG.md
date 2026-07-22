@@ -5,6 +5,12 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.7.0] - 2026-07-22
+
+### Features
+
+- Signal support via signal-cli + AskUserQuestion bridge ([#111](https://github.com/earlyaidopters/claudeclaw-os/pull/111))
+
 ## [1.6.1] - 2026-07-21
 
 ### Bug Fixes
