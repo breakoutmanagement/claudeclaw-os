@@ -172,38 +172,59 @@ export function checkPendingMigrations(projectRoot: string): void {
   const appliedFile = path.join(migrationsDir, '.applied.json');
   const storeDir = path.join(projectRoot, 'store');
 
+  // version.json ABSENT -> nothing to verify yet (legitimate skip).
+  // version.json PRESENT but unreadable/corrupt -> fail CLOSED: refuse to start
+  // rather than silently disabling the guard against a possibly unmigrated store.
+  let registry: VersionRegistry;
   try {
-    const registry: VersionRegistry = JSON.parse(fs.readFileSync(versionFile, 'utf-8'));
-    const versions = Object.keys(registry.migrations).sort(compareSemver);
-    if (versions.length === 0) return;
+    registry = JSON.parse(fs.readFileSync(versionFile, 'utf-8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    console.error(
+      `\n⚠️  ClaudeClaw cannot verify migrations: migrations/version.json is present but unreadable or not valid JSON.\n` +
+        `    Refusing to start to avoid running against an unmigrated store. Fix or restore the file, then restart.\n`,
+    );
+    process.exit(1);
+    return;
+  }
 
-    const latest = versions[versions.length - 1];
+  const versions = Object.keys(registry.migrations).sort(compareSemver);
+  if (versions.length === 0) return;
 
-    let lastApplied: string | null = null;
-    if (fs.existsSync(appliedFile)) {
+  const latest = versions[versions.length - 1];
+
+  let lastApplied: string | null = null;
+  if (fs.existsSync(appliedFile)) {
+    try {
       const state: AppliedState = JSON.parse(fs.readFileSync(appliedFile, 'utf-8'));
       lastApplied = state.lastApplied;
-    } else if (!fs.existsSync(storeDir)) {
-      // Fresh clone — store/ hasn't been created yet, so the bot has never run.
-      // Write .applied.json now so subsequent starts (after store/ is created) don't
-      // mistake this for a pre-migration install.
-      fs.writeFileSync(appliedFile, JSON.stringify({ lastApplied: latest }, null, 2) + '\n');
-      return;
-    }
-    // If .applied.json is absent but store/ exists, this is a pre-migration install.
-    // Fall through with lastApplied = null so the guard fires.
-
-    const hasPending =
-      lastApplied === null || compareSemver(lastApplied, latest) < 0;
-
-    if (hasPending) {
+    } catch {
+      // .applied.json present but unreadable/corrupt: fail CLOSED as well.
       console.error(
-        `\n⚠️  ClaudeClaw has pending migrations (applied: ${lastApplied ?? 'none'}, latest: ${latest}).\n` +
-          `    Run \`npm run migrate\` to update, then restart.\n`,
+        `\n⚠️  ClaudeClaw cannot verify migrations: migrations/.applied.json is present but unreadable or not valid JSON.\n` +
+          `    Refusing to start to avoid running against an unmigrated store. Fix or restore the file, then restart.\n`,
       );
       process.exit(1);
+      return;
     }
-  } catch {
-    // If version.json is missing or unreadable, skip the guard
+  } else if (!fs.existsSync(storeDir)) {
+    // Fresh clone — store/ hasn't been created yet, so the bot has never run.
+    // Write .applied.json now so subsequent starts (after store/ is created) don't
+    // mistake this for a pre-migration install.
+    fs.writeFileSync(appliedFile, JSON.stringify({ lastApplied: latest }, null, 2) + '\n');
+    return;
+  }
+  // If .applied.json is absent but store/ exists, this is a pre-migration install.
+  // Fall through with lastApplied = null so the guard fires.
+
+  const hasPending =
+    lastApplied === null || compareSemver(lastApplied, latest) < 0;
+
+  if (hasPending) {
+    console.error(
+      `\n⚠️  ClaudeClaw has pending migrations (applied: ${lastApplied ?? 'none'}, latest: ${latest}).\n` +
+        `    Run \`npm run migrate\` to update, then restart.\n`,
+    );
+    process.exit(1);
   }
 }

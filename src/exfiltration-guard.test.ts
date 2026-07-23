@@ -122,6 +122,19 @@ describe('scanForSecrets', () => {
     expect(matches[0].type).toBe('env_value');
   });
 
+  it('detects the RAW (verbatim) value of a protected secret (#160 S2)', () => {
+    // A secret that leaks in its native form (e.g. a Telegram token "12345:AA...")
+    // matches no generic pattern and no encoded variant — the raw value must be
+    // scanned directly or it passes through unredacted.
+    const secret = '1234567890:AAFAKEfakeFAKEfakeFAKEfakeFAKEfake123';
+    const text = `leaked token verbatim: ${secret} end`;
+    const matches = scanForSecrets(text, [secret]);
+    expect(matches.length).toBeGreaterThanOrEqual(1);
+    expect(matches.some((m) => m.position === text.indexOf(secret))).toBe(true);
+    // And it is actually redacted out of the outbound text.
+    expect(redactSecrets(text, matches)).not.toContain(secret);
+  });
+
   it('ignores protected values 8 chars or shorter', () => {
     const text = 'some text with short12 embedded';
     const matches = scanForSecrets(text, ['short']);

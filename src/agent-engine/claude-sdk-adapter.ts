@@ -88,6 +88,36 @@ function resolveClaudeExecutableOverride(): string | undefined {
 
 const CLAUDE_EXECUTABLE_OVERRIDE = resolveClaudeExecutableOverride();
 
+// The CLI dumps its full minified bundle into stderr on some errors (a failing
+// hook callback produced 777 × ~5 KB lines in one day). Relay a bounded snippet
+// and squelch repeats: identical messages log once, then every REPEAT_EVERYth
+// occurrence with the count. Factory exported for tests.
+const STDERR_SNIPPET_CHARS = 500;
+const STDERR_REPEAT_EVERY = 50;
+export function makeStderrRelay(
+  log: (obj: Record<string, unknown>, msg: string) => void,
+): (data: string) => void {
+  let lastKey = '';
+  let repeats = 0;
+  return (data: string) => {
+    const snippet =
+      data.length > STDERR_SNIPPET_CHARS
+        ? `${data.slice(0, STDERR_SNIPPET_CHARS)}… [truncated, ${data.length} chars total]`
+        : data;
+    const key = snippet.slice(0, 100);
+    if (key === lastKey) {
+      repeats++;
+      if (repeats % STDERR_REPEAT_EVERY !== 0) return;
+      log({ stderr: snippet, repeats }, 'claude subprocess stderr (repeating)');
+      return;
+    }
+    lastKey = key;
+    repeats = 0;
+    log({ stderr: snippet }, 'claude subprocess stderr');
+  };
+}
+const relayStderr = makeStderrRelay((obj, msg) => logger.error(obj, msg));
+
 const TOOL_LABELS: Record<string, string> = {
   Read: 'Reading file',
   Write: 'Writing file',
@@ -281,7 +311,7 @@ export class ClaudeSdkEngineAdapter implements AgentEngine {
           ...(input.disallowedTools ? { disallowedTools: input.disallowedTools } : {}),
           ...(input.abortController ? { abortController: input.abortController } : {}),
           ...(CLAUDE_EXECUTABLE_OVERRIDE ? { pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE_OVERRIDE } : {}),
-          stderr: (data: string) => logger.error({ stderr: data }, 'claude subprocess stderr'),
+          stderr: relayStderr,
           // TODO(#72): the SDK Options type (@anthropic-ai/claude-agent-sdk) lags
           // some fields we pass conditionally (effort, thinking, model overrides),
           // so the whole object is cast. Narrow to the SDK Options type and cast

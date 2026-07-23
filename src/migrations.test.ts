@@ -227,6 +227,28 @@ describe('checkPendingMigrations', () => {
 
       expect(process.exit).not.toHaveBeenCalled();
     });
+
+    // ── fail-closed on corrupt registry (#160 S6) ──────────────────────────
+    it('fails CLOSED when version.json is present but corrupt', () => {
+      const migrationsDir = path.join(tmpDir, 'migrations');
+      fs.mkdirSync(migrationsDir, { recursive: true });
+      fs.writeFileSync(path.join(migrationsDir, 'version.json'), '{ not valid json');
+
+      checkPendingMigrations(tmpDir);
+
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
+
+    it('fails CLOSED when .applied.json is present but corrupt', () => {
+      writeVersionJson({ 'v1.0.0': [], 'v1.1.0': [] });
+      createStoreDir();
+      const migrationsDir = path.join(tmpDir, 'migrations');
+      fs.writeFileSync(path.join(migrationsDir, '.applied.json'), '{ corrupt');
+
+      checkPendingMigrations(tmpDir);
+
+      expect(process.exit).toHaveBeenCalledWith(1);
+    });
   });
 });
 
