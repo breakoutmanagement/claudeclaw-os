@@ -76,4 +76,16 @@ describe('renderCliIndex (prompt injection)', () => {
     expect(index.toLowerCase()).toContain('raw sqlite3');
     expect(index).toContain('dist/hive-cli.js');
   });
+
+  it('stamps the absolute root and forbids git rev-parse rediscovery when a root is given (issue #157)', () => {
+    const abs = '/d/projects/eai/claudeclaw-os';
+    const stamped = renderCliIndex(allDescriptors, abs);
+    // The known-absolute root is stamped in and rediscovery is banned...
+    expect(stamped).toContain(`PROJECT_ROOT=${abs}`);
+    expect(stamped).toContain('Do NOT run `git rev-parse`');
+    expect(stamped).not.toContain('git rev-parse --show-toplevel');
+    // ...while the runnable node form and sqlite3 ban survive.
+    expect(stamped).toContain('node "$PROJECT_ROOT/');
+    expect(stamped.toLowerCase()).toContain('raw sqlite3');
+  });
 });

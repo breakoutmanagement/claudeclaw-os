@@ -17,7 +17,11 @@ import type { ProviderConfig } from './provider.js';
  */
 function withCliIndex(persona: string | undefined): string | undefined {
   if (!persona) return persona;
-  return persona + '\n\n' + renderCliIndex(allDescriptors);
+  // Stamp the known-absolute PROJECT_ROOT into the injected index so agents
+  // never rediscover the root via `git rev-parse` — scheduled/automation turns
+  // run from the agent config dir (a non-repo cwd) and would otherwise anchor
+  // to a sibling checkout. See issue #157.
+  return persona + '\n\n' + renderCliIndex(allDescriptors, PROJECT_ROOT);
 }
 
 const envConfig = readEnvFile([
