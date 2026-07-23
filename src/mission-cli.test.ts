@@ -104,3 +104,37 @@ describe('mission-cli create — resolve-then-store guard', () => {
     expect(created.stdout).toContain('unassigned');
   });
 });
+
+describe('mission-cli — unknown flag rejection (#162)', () => {
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claudeclaw-mission-cli-'));
+    cfgDir = path.join(tmpRoot, 'config');
+    storeDir = path.join(tmpRoot, 'store');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.mkdirSync(storeDir, { recursive: true });
+    seedAgent('main', { name: 'Holden', description: 'hub' });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('rejects a typo\'d flag instead of swallowing it as the prompt', () => {
+    // Previously `--body` was not recognized, not stripped, and became the
+    // literal positional prompt — silently corrupting the task body.
+    const created = run('create --agent main --title "X" --body "oops" "real prompt"');
+    expect(created.status).not.toBe(0);
+    expect(created.stderr).toContain('Unknown flag(s): --body');
+    expect(created.stderr).toContain('Known flags:');
+
+    // Nothing was written.
+    const listed = run('list');
+    expect(listed.stdout).toContain('No mission tasks');
+  });
+
+  it('still accepts a valid create with only known flags', () => {
+    const created = run('create --agent main --title "X" "real prompt"');
+    expect(created.status).toBe(0);
+    expect(created.stdout).toMatch(/Mission task created/);
+  });
+});

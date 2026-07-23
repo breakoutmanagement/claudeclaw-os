@@ -110,6 +110,22 @@ taskFlagIndices.forEach((idx) => flagIndices.add(idx));
 const cleanedArgv = process.argv.filter((_, i) => !flagIndices.has(i));
 const [, , command, ...rest] = cleanedArgv;
 
+// Reject unknown --flags rather than swallowing them as positional prompt text.
+// Known flag pairs are stripped above; any leftover token starting with `--` is
+// a typo'd/unsupported flag (e.g. `--body`). Without this guard it would be
+// silently accepted as the prompt/report body and corrupt the task. See #162.
+const KNOWN_FLAGS = [
+  '--agent', '--title', '--priority', '--status', '--summary-agent', '--task',
+  '--help',
+];
+const unknownFlags = rest.filter((tok) => tok.startsWith('--'));
+if (unknownFlags.length > 0) {
+  console.error(`Unknown flag(s): ${unknownFlags.join(', ')}`);
+  console.error(`Known flags: ${KNOWN_FLAGS.join(', ')}`);
+  console.error('If this was meant as prompt text, drop the leading "--".');
+  process.exit(1);
+}
+
 function formatDate(unix: number | null): string {
   if (!unix) return '-';
   return new Date(unix * 1000).toLocaleString('en-US', {
