@@ -5,6 +5,18 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.7.1] - 2026-07-23
+
+### Bug Fixes
+
+- Reject unknown --flags instead of swallowing them ([#162](https://github.com/earlyaidopters/claudeclaw-os/pull/162)) ([#164](https://github.com/earlyaidopters/claudeclaw-os/pull/164))
+- Stamp absolute PROJECT_ROOT into injected CLI index ([#157](https://github.com/earlyaidopters/claudeclaw-os/pull/157)) ([#163](https://github.com/earlyaidopters/claudeclaw-os/pull/163))
+- Reconcile specialist agent seeds with the template (file-send + handback sections, hive-cli over raw sqlite3, drift guard) ([#166](https://github.com/earlyaidopters/claudeclaw-os/pull/166))
+
+### Security
+
+- Harden War Room bind, log redaction, exfil guard, migration guard (#160, #161) ([#165](https://github.com/earlyaidopters/claudeclaw-os/pull/165))
+
 ## [1.7.0] - 2026-07-22
 
 ### Features
