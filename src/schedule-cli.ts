@@ -13,6 +13,7 @@
  */
 
 import { randomBytes } from 'crypto';
+import { pathToFileURL } from 'url';
 
 import {
   initDatabase,
@@ -23,14 +24,33 @@ import {
   resumeScheduledTask,
 } from './db.js';
 import { computeNextRun } from './scheduler.js';
+import { renderHelp } from './cli-reference.js';
+import { scheduleDescriptor as descriptor } from './cli-descriptors.js';
+import { resolveAgentOrExit } from './resolve-agent.js';
 
+// Only run the CLI when invoked directly, so importing `descriptor` (for docs
+// generation and the drift-guard test) does not trigger DB init or arg parsing.
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log(renderHelp(descriptor));
+    process.exit(0);
+  }
+  runCli();
+}
+
+function runCli(): void {
 initDatabase();
 
 // Parse --agent flag from anywhere in argv, fall back to CLAUDECLAW_AGENT_ID env var
 const agentFlagIdx = process.argv.indexOf('--agent');
-const cliAgentId = agentFlagIdx !== -1
+const rawAgentId = agentFlagIdx !== -1
   ? process.argv[agentFlagIdx + 1] ?? 'main'
   : process.env.CLAUDECLAW_AGENT_ID ?? 'main';
+// Resolve display-name/alias -> canonical id (reject-unknown guard). Defaults
+// to 'main', which always resolves, so only an explicit bad --agent aborts.
+const cliAgentId = resolveAgentOrExit(rawAgentId);
 // Remove --agent and its value from rest args (only filter when flag is present)
 const cleanedArgv = agentFlagIdx !== -1
   ? process.argv.filter((_, i) => i !== agentFlagIdx && i !== agentFlagIdx + 1)
@@ -122,4 +142,5 @@ switch (command) {
   default:
     console.error('Commands: create | list | delete | pause | resume');
     process.exit(1);
+}
 }

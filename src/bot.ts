@@ -43,10 +43,10 @@ import {
   agentDisplayName,
   agentCostFooter,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice } from './db.js';
-import { resolvePrimaryAgentId, setAgentProvider } from './agent-config.js';
+import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount, getMemoryMigrationNotice, setMemoryMigrationNotice, getCacheTokens } from './db.js';
+import { resolvePrimaryAgentId, setAgentProvider, resolveAgentDisplayName } from './agent-config.js';
 import { logger } from './logger.js';
-import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
+import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage, buildMediaGroupMessage, createMediaGroupBuffer } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
 import { classifyMessageComplexity } from './message-classifier.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
@@ -63,6 +63,7 @@ import { DEFAULT_CLAUDE_MODEL, getMainProviderConfig, getProviderDisplay, Provid
 import { engineSupportsSystemPrompt } from './agent-engine/index.js';
 import { setHighImportanceCallback } from './memory-ingest.js';
 import { messageQueue } from './message-queue.js';
+import { applyOtherSelection, stepHint } from './auq-selection.js';
 import { parseDelegation, delegateToAgent, getAvailableAgents } from './orchestrator.js';
 import { emitChatEvent, setProcessing, setActiveAbort, abortActiveQuery } from './state.js';
 import {
@@ -399,6 +400,103 @@ export function formatForTelegram(text: string): string {
 }
 
 /**
+ * Convert Markdown to plain text suitable for Signal.
+ *
+ * Signal does not render Markdown or HTML — Telegram's <b>/<i> tags would
+ * appear as literal characters. Strip the syntax, keep the structure
+ * (headings on their own line, code blocks indented, links inline as
+ * "text (url)"). Used by signal-bot.ts and the scheduler when
+ * MESSENGER_TYPE=signal.
+ */
+export function formatForSignal(text: string): string {
+  // 1. Protect fenced code blocks (we strip the fence, keep the content)
+  const codeBlocks: string[] = [];
+  let result = text.replace(/```(?:\w*\n)?([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code.trim());
+    return `\x00CB${codeBlocks.length - 1}\x00`;
+  });
+
+  // 2. Protect inline code
+  const inlineCodes: string[] = [];
+  result = result.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code);
+    return `\x00IC${inlineCodes.length - 1}\x00`;
+  });
+
+  // 3. Headings → plain line (drop the # prefix)
+  result = result.replace(/^#{1,6}\s+(.+)$/gm, '$1');
+
+  // 4. Horizontal rules → drop
+  result = result.replace(/\n*^[-*_]{3,}$\n*/gm, '\n');
+
+  // 5. Checkboxes
+  result = result.replace(/^(\s*)-\s+\[x\]\s*/gim, '$1✓ ');
+  result = result.replace(/^(\s*)-\s+\[\s\]\s*/gm, '$1☐ ');
+
+  // 5b. Markdown bullet lists (- / *) → a clean "•" bullet. Signal renders no
+  // list markup, and a bare "-" reads worse on a phone than "•". Runs after
+  // checkboxes (so ✓/☐ lines are already converted) and before the italic pass
+  // (so a leading "* item" isn't mistaken for emphasis).
+  result = result.replace(/^(\s*)[-*]\s+/gm, '$1• ');
+
+  // 6. Bold **x** and __x__ → x
+  result = result.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  result = result.replace(/__([^_\n]+)__/g, '$1');
+
+  // 7. Italic *x* and _x_ → x
+  result = result.replace(/\*([^*\n]+)\*/g, '$1');
+  result = result.replace(/(?<!\w)_([^_\n]+)_(?!\w)/g, '$1');
+
+  // 8. Strikethrough ~~x~~ → x
+  result = result.replace(/~~([^~\n]+)~~/g, '$1');
+
+  // 9. Links [text](url) → "text (url)"
+  result = result.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '$1 ($2)');
+
+  // 10. Restore code blocks (no fences, just plain text)
+  result = result.replace(/\x00CB(\d+)\x00/g, (_, i) => '\n' + codeBlocks[parseInt(i)] + '\n');
+  result = result.replace(/\x00IC(\d+)\x00/g, (_, i) => inlineCodes[parseInt(i)]);
+
+  // 11. Clean up HTML that snuck through. The LLM sometimes emits HTML directly,
+  // or the scheduler/oauth-health path pre-formats for Telegram (which builds
+  // <a href>, <b>, <pre> …) and that reaches a Signal recipient — where it would
+  // render as literal characters. Keep the content and, for links, the URL.
+  //
+  // 11a. <a href="url">text</a> → "text (url)" (mirrors the Markdown-link rule
+  //      above; otherwise the whole tag renders literally).
+  result = result.replace(
+    /<a\b[^>]*?href=["']?(https?:\/\/[^"'>\s]+)["']?[^>]*>([\s\S]*?)<\/a>/gi,
+    '$2 ($1)',
+  );
+  // 11b. Structural tags that carry a line break: <br> and <li> become real
+  //      newlines / bullets so lists and multi-line HTML stay readable.
+  result = result.replace(/<br\s*\/?>/gi, '\n');
+  result = result.replace(/<li\b[^>]*>/gi, '\n• ');
+  // 11c. Strip the remaining known formatting/structural tags but keep their
+  //      content. Whitelist (not a blanket /<[^>]*>/) so literal comparison
+  //      operators ("a < b > c") are never mistaken for tags.
+  result = result.replace(
+    /<\/?(?:a|b|i|u|s|strong|em|del|code|pre|kbd|tg-spoiler|br|p|div|span|ul|ol|li|blockquote|h[1-6]|hr|table|thead|tbody|tr|td|th)\b[^>]*>/gi,
+    '',
+  );
+  // 11d. Strip ANSI colour/CSI escape sequences and stray control chars that
+  //      leak in from raw terminal/tool output. Keeps \n and \t; drops \r.
+  result = result.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+  result = result.replace(/[\x00-\x08\x0B-\x1F]/g, '');
+  result = result
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+
+  // 12. Collapse 3+ blank lines down to 2
+  result = result.replace(/\n{3,}/g, '\n\n');
+
+  return result.trim();
+}
+
+/**
  * Split a long response into Telegram-safe chunks (4096 chars).
  * Splits on newlines where possible to avoid breaking mid-sentence.
  */
@@ -657,12 +755,17 @@ function makeToken(): string {
   return Math.random().toString(36).slice(2, 8);
 }
 
-/** Text for the current step: "(2/3) <question>" when there are several. */
+/**
+ * Text for the current step: "(2/3) <question>" when there are several, plus a
+ * hint telling the user whether to pick one or check several. Multi-select is
+ * easy to miss on Telegram (a tap doesn't auto-advance like single-select), so
+ * the cue points them at Done.
+ */
 function buildStepText(q: PendingQuestion): string {
   const n = q.request.questions.length;
   const cur = q.request.questions[q.current];
   const prefix = n > 1 ? `(${q.current + 1}/${n}) ` : '';
-  return `${prefix}${cur.question}`;
+  return `${prefix}${cur.question}\n_${stepHint(!!cur.multiSelect)}_`;
 }
 
 /**
@@ -877,7 +980,12 @@ async function maybeCaptureOtherReply(ctx: Context, chatIdStr: string, message: 
   const q = pendingQuestions.get(token);
   if (!q || !q.awaitingOther) return false;
 
-  q.selections[q.current] = [message.trim()];
+  const cur = q.request.questions[q.current];
+  q.selections[q.current] = applyOtherSelection(
+    q.selections[q.current] ?? [],
+    message,
+    !!cur.multiSelect,
+  );
   q.awaitingOther = false;
   // Record only — re-render the step so the user can Next/Done from here.
   if (q.messageId) {
@@ -1433,12 +1541,21 @@ async function handleMessage(ctx: Context, message: string, forceVoiceReply = fa
           activeSessionId,
           result.usage.inputTokens,
           result.usage.outputTokens,
-          result.usage.lastCallCacheRead,
+          result.usage.cacheReadInputTokens,
           result.usage.lastCallCacheRead + result.usage.lastCallInputTokens,
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
           result.usage.contextWindow,
+          result.usage.cacheCreationInputTokens,
+          {
+            model: result.usage.model,
+            durationMs: result.usage.durationMs,
+            durationApiMs: result.usage.durationApiMs,
+            numTurns: result.usage.numTurns,
+            stopReason: result.usage.stopReasonDetail,
+            isError: result.usage.isError,
+          },
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');
@@ -1523,16 +1640,18 @@ function discoverSkillCommands(): Array<{ command: string; description: string }
       // Check user_invocable: true
       if (!/user_invocable:\s*true/i.test(fm)) continue;
 
-      // Extract name
+      // Extract name (Telegram command names: 1-32 chars, [a-z0-9_]).
+      // Clamp to 32 — an over-long name 400s the whole setMyCommands call.
       const nameMatch = fm.match(/^name:\s*(.+)$/m);
       if (!nameMatch) continue;
-      const name = nameMatch[1].trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      const name = nameMatch[1].trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 32);
       if (!name) continue;
 
-      // Extract description (truncate to 256 chars for Telegram limit)
+      // Extract description (clamp to 250; Telegram hard limit is 256, keep
+      // headroom so a single long description can't 400 the whole call).
       const descMatch = fm.match(/^description:\s*(.+)$/m);
       const desc = descMatch
-        ? descMatch[1].trim().slice(0, 256)
+        ? descMatch[1].trim().slice(0, 250)
         : `Run the ${name} skill`;
 
       commands.push({ command: name, description: desc });
@@ -1611,19 +1730,31 @@ export function createBot(): Bot {
     { command: 'model', description: 'Switch model (opus/sonnet/haiku)' },
     { command: 'provider', description: 'Show active provider' },
     { command: 'memory', description: 'View recent memories' },
+    { command: 'cache', description: 'Per-agent prompt-cache usage' },
     { command: 'forget', description: 'Clear session' },
     { command: 'wa', description: 'Recent WhatsApp messages' },
     { command: 'slack', description: 'Recent Slack messages' },
     { command: 'dashboard', description: 'Open web dashboard' },
     { command: 'stop', description: 'Stop current processing' },
     { command: 'agents', description: 'List available agents' },
-    { command: 'delegate', description: 'Delegate task to agent' },
+    { command: 'delegate', description: 'Hand a task to one agent (async)' },
+    { command: 'await', description: 'Fan out to agents, wait for one summary' },
+    { command: 'gather', description: 'Fan out to agents, notify when all done' },
     { command: 'lock', description: 'Lock session (requires PIN to unlock)' },
     { command: 'status', description: 'Show security status' },
   ];
   const skillCommands = discoverSkillCommands();
   const allCommands = [...builtInCommands, ...skillCommands].slice(0, 100); // Telegram limit: 100 commands
-  bot.api.setMyCommands(allCommands)
+  // Assert a clean slate: clear any non-default command scopes first. Telegram
+  // serves the MOST-SPECIFIC scope, and we only ever write the default scope.
+  // A reused token can carry a stale all_private_chats/all_group_chats scope
+  // from a prior bot (e.g. 52 foreign commands) that silently shadows ours on
+  // every client. We can't override a scope we don't set, so delete them.
+  Promise.all([
+    bot.api.deleteMyCommands({ scope: { type: 'all_private_chats' } }).catch(() => {}),
+    bot.api.deleteMyCommands({ scope: { type: 'all_group_chats' } }).catch(() => {}),
+  ])
+    .then(() => bot.api.setMyCommands(allCommands))
     .then(() => logger.info({ count: skillCommands.length }, 'Registered %d skill commands with Telegram', skillCommands.length))
     .catch((err) => logger.warn({ err }, 'Failed to register bot commands with Telegram'));
 
@@ -1638,16 +1769,23 @@ export function createBot(): Bot {
       '/model — Switch model (opus/sonnet/haiku)\n' +
       '/provider — Show active provider/model source\n' +
       '/memory — View recent memories\n' +
+      '/cache — Per-agent prompt-cache usage ([days], default 30)\n' +
       '/forget — Clear session\n' +
       '/wa — WhatsApp messages\n' +
       '/slack — Slack messages\n' +
       '/dashboard — Web dashboard\n' +
       '/stop — Stop current processing\n' +
       '/agents — List available agents\n' +
-      '/delegate — Delegate task to agent\n' +
+      '/delegate — Hand a task to one agent, async (delegate)\n' +
+      '/await — Fan out to agents, wait for one combined summary\n' +
+      '/gather — Fan out to agents, get notified when all finish\n' +
       '/lock — Lock session (PIN required to unlock)\n' +
       '/status — Security status\n\n' +
-      'Delegation: @agentId: prompt or /delegate agentId prompt\n\n' +
+      'Orchestration: use the commands above, or just ask in plain English —\n' +
+      '  "have amos pull the SCCHA cards and report back" (delegate)\n' +
+      '  "ask naomi and amos each for today\'s highlights, wait for both" (await)\n' +
+      '  "kick off research across three agents and ping me when all are done" (gather)\n' +
+      'Shorthand: @agentId: prompt or /delegate agentId prompt\n\n' +
       'You can also send voice notes, photos, files, and videos.'
     );
   });
@@ -1878,6 +2016,41 @@ export function createBot(): Bot {
     }
   });
 
+  // /cache [days] — per-agent prompt-cache token usage over a window (default 30d)
+  bot.command('cache', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const chatId = ctx.chat!.id.toString();
+    const days = Math.min(365, Math.max(1, Number.parseInt(ctx.match?.trim() || '', 10) || 30));
+    const rows = getCacheTokens(chatId, days);
+    if (rows.length === 0) {
+      await ctx.reply(`No cache activity in the last ${days}d yet.`);
+      return;
+    }
+    const fmt = (n: number) => Math.round(n).toLocaleString('en-US');
+    // Cache hit rate = share of prompt-input tokens served from cache.
+    const hitRate = (read: number, write: number, input: number): string => {
+      const total = read + write + input;
+      return total > 0 ? `${((read / total) * 100).toFixed(1)}%` : 'n/a';
+    };
+    let totalRead = 0;
+    let totalCreate = 0;
+    let totalInput = 0;
+    const lines = rows.map((r) => {
+      totalRead += r.cacheRead;
+      totalCreate += r.cacheCreation;
+      totalInput += r.inputTokens;
+      return `<b>${escapeHtml(resolveAgentDisplayName(r.agentId))}</b> · ${fmt(r.turns)} turns · hit <b>${hitRate(r.cacheRead, r.cacheCreation, r.inputTokens)}</b>\n` +
+        `  read ${fmt(r.cacheRead)} · write ${fmt(r.cacheCreation)} tok`;
+    });
+    const header = `<b>Cache usage — last ${days}d</b>\n` +
+      `Hit rate <b>${hitRate(totalRead, totalCreate, totalInput)}</b> · read ${fmt(totalRead)} / write ${fmt(totalCreate)} tok`;
+    const footer = `<i>hit rate = cached-read share of prompt input (measured token counts, not dollars)</i>`;
+    const reply = `${header}\n\n${lines.join('\n')}\n\n${footer}`;
+    for (const part of splitMessage(reply)) {
+      await ctx.reply(part, { parse_mode: 'HTML' });
+    }
+  });
+
   // /pin <id> — make a memory permanent (never decays)
   bot.command('pin', async (ctx) => {
     if (await replyIfLocked(ctx)) return;
@@ -2076,8 +2249,36 @@ export function createBot(): Bot {
     messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/delegate ${args}`));
   });
 
+  // /await <agentId,agentId,...> <prompt> — fan out to agents and wait for one combined summary (blocking)
+  bot.command('await', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const args = ctx.match?.trim();
+    if (!args) {
+      const agents = getAvailableAgents();
+      const agentList = agents.length > 0 ? agents.map((a) => a.id).join(', ') : '(none configured)';
+      await ctx.reply(`Usage: /await <agentId,agentId,...> <prompt>\n\nSends the prompt to each agent and waits for one combined answer in this turn.\n\nAvailable agents: ${agentList}`);
+      return;
+    }
+    const chatIdStr = ctx.chat!.id.toString();
+    messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/await ${args}`));
+  });
+
+  // /gather <agentId,agentId,...> <prompt> — fan out to agents, get notified when all finish (non-blocking join)
+  bot.command('gather', async (ctx) => {
+    if (await replyIfLocked(ctx)) return;
+    const args = ctx.match?.trim();
+    if (!args) {
+      const agents = getAvailableAgents();
+      const agentList = agents.length > 0 ? agents.map((a) => a.id).join(', ') : '(none configured)';
+      await ctx.reply(`Usage: /gather <agentId,agentId,...> <prompt>\n\nSends the prompt to each agent and pings you with one consolidated summary once the last one finishes.\n\nAvailable agents: ${agentList}`);
+      return;
+    }
+    const chatIdStr = ctx.chat!.id.toString();
+    messageQueue.enqueue(chatIdStr, () => handleMessage(ctx, `/gather ${args}`));
+  });
+
   // Text messages — and any slash commands not owned by this bot (skills, e.g. /todo /gmail)
-  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/lock', '/status']);
+  const OWN_COMMANDS = new Set(['/start', '/help', '/newchat', '/respin', '/voice', '/model', '/provider', '/memory', '/cache', '/forget', '/pin', '/unpin', '/chatid', '/wa', '/slack', '/dashboard', '/stop', '/agents', '/delegate', '/await', '/gather', '/lock', '/status']);
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text;
     const chatIdStr = ctx.chat!.id.toString();
@@ -2106,6 +2307,16 @@ export function createBot(): Bot {
       return;
     }
     touchActivity();
+
+    // ── AskUserQuestion "Other" free-text reply ─────────────────────
+    // Must be captured OUTSIDE the serial message queue. The turn that opened
+    // the question is still in-flight awaiting the resolver, so an enqueued
+    // reply would sit behind it forever — the user then taps Done (a callback,
+    // which bypasses the queue), the question finalizes with this slot empty
+    // (reported as skipped), and the queued text later fires as a stray new
+    // turn. Handling it inline here (like a callback tap) resolves the pending
+    // question immediately.
+    if (await maybeCaptureOtherReply(ctx, chatIdStr, text)) return;
 
     // ── WhatsApp state machine ──────────────────────────────────────
     const state = waState.get(chatIdStr);
@@ -2292,6 +2503,33 @@ export function createBot(): Bot {
   });
 
   // Photos — download and pass to Claude
+  // --- Telegram albums (media groups) ---
+  // Multiple files sent together arrive as separate updates sharing a
+  // media_group_id, with the caption on only one. Buffer them (debounced) and
+  // submit ONE turn with all files + the caption, instead of one file per turn.
+  // Latest ctx per group key, used to reply to the chat when the group flushes.
+  const mediaGroupCtx = new Map<string, Context>();
+  const mediaBuffer = createMediaGroupBuffer({
+    onFlush: (key, items, caption) => {
+      const ctx = mediaGroupCtx.get(key);
+      mediaGroupCtx.delete(key);
+      if (!ctx) return;
+      const chatId = key.split(':')[0];
+      const msg = buildMediaGroupMessage(items, caption);
+      messageQueue.enqueue(chatId, () => handleMessage(ctx, msg));
+    },
+  });
+  // Register album membership at message ARRIVAL (before awaiting the download),
+  // passing the download as a promise, so slow downloads can't split the group.
+  function bufferMediaGroup(
+    ctx: Context, chatId: number, groupId: string,
+    item: Promise<{ path: string; label?: string }>, caption?: string,
+  ): void {
+    const key = `${chatId}:${groupId}`;
+    mediaGroupCtx.set(key, ctx); // latest ctx is fine for replying to the chat
+    mediaBuffer.add(key, item, caption);
+  }
+
   bot.on('message:photo', async (ctx) => {
     const chatId = ctx.chat!.id;
     if (!isAuthorised(chatId)) return;
@@ -2304,6 +2542,12 @@ export function createBot(): Bot {
 
     try {
       const photo = ctx.message.photo[ctx.message.photo.length - 1];
+      const gid = ctx.message.media_group_id;
+      if (gid) {
+        const dl = downloadMedia(activeBotToken, photo.file_id, 'photo.jpg').then((path) => ({ path }));
+        bufferMediaGroup(ctx, chatId, gid, dl, ctx.message.caption ?? undefined);
+        return;
+      }
       const localPath = await downloadMedia(activeBotToken, photo.file_id, 'photo.jpg');
       const msg = buildPhotoMessage(localPath, ctx.message.caption ?? undefined);
       const chatIdStr = chatId.toString();
@@ -2328,6 +2572,12 @@ export function createBot(): Bot {
     try {
       const doc = ctx.message.document;
       const filename = doc.file_name ?? 'file';
+      const gid = ctx.message.media_group_id;
+      if (gid) {
+        const dl = downloadMedia(activeBotToken, doc.file_id, filename).then((path) => ({ path, label: filename }));
+        bufferMediaGroup(ctx, chatId, gid, dl, ctx.message.caption ?? undefined);
+        return;
+      }
       const localPath = await downloadMedia(activeBotToken, doc.file_id, filename);
       const msg = buildDocumentMessage(localPath, filename, ctx.message.caption ?? undefined);
       const chatIdStr = chatId.toString();
@@ -2570,12 +2820,21 @@ async function processDashboardMessage(
           activeSessionId,
           result.usage.inputTokens,
           result.usage.outputTokens,
-          result.usage.lastCallCacheRead,
+          result.usage.cacheReadInputTokens,
           result.usage.lastCallCacheRead + result.usage.lastCallInputTokens,
           result.usage.totalCostUsd,
           result.usage.didCompact,
           AGENT_ID,
           result.usage.contextWindow,
+          result.usage.cacheCreationInputTokens,
+          {
+            model: result.usage.model,
+            durationMs: result.usage.durationMs,
+            durationApiMs: result.usage.durationApiMs,
+            numTurns: result.usage.numTurns,
+            stopReason: result.usage.stopReasonDetail,
+            isError: result.usage.isError,
+          },
         );
       } catch (dbErr) {
         logger.error({ err: dbErr }, 'Failed to save token usage');

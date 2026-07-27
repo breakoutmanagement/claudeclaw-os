@@ -5,6 +5,82 @@ All notable changes to ClaudeClaw will be documented here.
 From v1.2.0 onward this file is generated from Conventional Commit history with
 [git-cliff](https://git-cliff.org). Do not hand-edit it. See CONTRIBUTING.md.
 
+## [1.7.1] - 2026-07-23
+
+### Bug Fixes
+
+- Reject unknown --flags instead of swallowing them ([#162](https://github.com/earlyaidopters/claudeclaw-os/pull/162)) ([#164](https://github.com/earlyaidopters/claudeclaw-os/pull/164))
+- Stamp absolute PROJECT_ROOT into injected CLI index ([#157](https://github.com/earlyaidopters/claudeclaw-os/pull/157)) ([#163](https://github.com/earlyaidopters/claudeclaw-os/pull/163))
+- Reconcile specialist agent seeds with the template (file-send + handback sections, hive-cli over raw sqlite3, drift guard) ([#166](https://github.com/earlyaidopters/claudeclaw-os/pull/166))
+
+### Security
+
+- Harden War Room bind, log redaction, exfil guard, migration guard (#160, #161) ([#165](https://github.com/earlyaidopters/claudeclaw-os/pull/165))
+
+## [1.7.0] - 2026-07-22
+
+### Features
+
+- Signal support via signal-cli + AskUserQuestion bridge ([#111](https://github.com/earlyaidopters/claudeclaw-os/pull/111))
+
+## [1.6.1] - 2026-07-21
+
+### Bug Fixes
+
+- Delegate with the target agent's provider, not the caller's ([#158](https://github.com/earlyaidopters/claudeclaw-os/pull/158))
+
+## [1.6.0] - 2026-07-21
+
+### Features
+
+- Reconcile agent id/display-name/alias routing ([#154](https://github.com/earlyaidopters/claudeclaw-os/pull/154))
+
+## [1.5.1] - 2026-07-18
+
+### Bug Fixes
+
+- End SQLITE_BUSY starvation + normalize CLI invocation (Closes #155) ([#156](https://github.com/earlyaidopters/claudeclaw-os/pull/156))
+
+### Features
+
+- CLI-awareness descriptor registry + generated reference + prompt-injected index ([#153](https://github.com/earlyaidopters/claudeclaw-os/pull/153))
+
+## [1.5.0] - 2026-07-17
+
+### Bug Fixes
+
+- Always sandbox CLAUDECLAW_CONFIG so the suite can't poison a real config ([#149](https://github.com/earlyaidopters/claudeclaw-os/pull/149))
+- Always write main's agent.yaml to CLAUDECLAW_CONFIG ([#147](https://github.com/earlyaidopters/claudeclaw-os/pull/147))
+
+### Documentation
+
+- Drop redundant "RFC:" heading prefix; correct rfc-sdk-engine authorship
+- Add Agent Awareness & Deterministic Comms RFC + normalize RFC frontmatter
+
+### Features
+
+- Token/cost observability — Foundation (cache hit-rate, /savings, dashboard, telemetry) ([#143](https://github.com/earlyaidopters/claudeclaw-os/pull/143))
+- Deterministic comms + gather orchestration (Refs #141, Tiers 2-3) ([#144](https://github.com/earlyaidopters/claudeclaw-os/pull/144))
+- Agent self-location + Telegram command-scope self-heal (Tier 1) ([#142](https://github.com/earlyaidopters/claudeclaw-os/pull/142))
+- Bootstrap main's external agent.yaml on boot ([#148](https://github.com/earlyaidopters/claudeclaw-os/pull/148)) ([#150](https://github.com/earlyaidopters/claudeclaw-os/pull/150))
+- Handle media groups (multiple photos/files in one turn) ([#124](https://github.com/earlyaidopters/claudeclaw-os/pull/124))
+
+## [1.4.1] - 2026-07-11
+
+### Bug Fixes
+
+- Auto-fall-back to system claude on non-AVX Intel Macs ([#132](https://github.com/earlyaidopters/claudeclaw-os/pull/132))
+- Capture AskUserQuestion Other reply outside the message queue ([#131](https://github.com/earlyaidopters/claudeclaw-os/pull/131))
+- Copy-fallback for AGENTS.md on symlink-restricted platforms ([#140](https://github.com/earlyaidopters/claudeclaw-os/pull/140))
+- Refresh lockfile and add security overrides ([#139](https://github.com/earlyaidopters/claudeclaw-os/pull/139))
+- Remove root AGENTS.md symlink orphaned by #64 ([#138](https://github.com/earlyaidopters/claudeclaw-os/pull/138))
+- Route claude CLI off the unrunnable SDK binary on NixOS
+- Write vite manualChunks in function form for rolldown compatibility ([#137](https://github.com/earlyaidopters/claudeclaw-os/pull/137))
+
+### Documentation
+
+- Add respin-session, token-cost observability, and agent-identity RFCs ([#133](https://github.com/earlyaidopters/claudeclaw-os/pull/133))
+
 ## [1.4.0] - 2026-07-03
 
 ### Bug Fixes
