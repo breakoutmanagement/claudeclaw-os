@@ -1,17 +1,14 @@
 # Upstream sync log
 
-One entry per sync of `earlyaidopters/claudeclaw-os` (upstream) into
-`breakoutmanagement/claudeclaw-os` (our fork). Format per the wrapper
-runbook `docs/upstream-sync-runbook.md`.
+One entry per sync run (newest first). Format per docs/upstream-sync-runbook.md.
 
-| Date | Upstream range | Commits | Merge commit | Conflicts resolved | Node | Gate | Notes |
-|---|---|---|---|---|---|---|---|
-| 2026-05-18 | ..(prior) | - | 265a6a5 | - | - | - | prior sync (pre-ledger) |
-| 2026-07-06 | b414b7b..a5accd5 | 62 | a37bb34 | 5 (db, dashboard, index, config, package-lock) | .nvmrc 22->24; engines >=22 <25 | typecheck 0 err, build EXIT 0 (local Node 24); tests+sqlite on host | 48 days of drift closed (past 14-day budget). 10 pre-existing prod vulns unchanged, tracked separately. Host confirmed Node 24.15.0 / better-sqlite3 11.10.0 prebuilt loads. |
+## 2026-07-27 - v1.7.1 (PR #19)
 
-## Drift budget
-
-Runbook target: never more than 14 days behind upstream without a recorded
-reason. The 2026-07-06 sync closed a 48-day gap (last sync 2026-05-18). Reason
-for the gap: no local fork checkout existed; the sync clone had to be
-re-established this session.
+- Upstream range: 8e532d9..887f820 (22 commits, releases 1.5.0 -> 1.7.1)
+- Source: vendor token-server reclone (GitHub upstream earlyaidopters/claudeclaw-os went private; git-fetch sync path is dead - all 4 org accounts get 404)
+- Also merged: box-local lineage from ts-cc-os-vanilla (f6fb28d: baseline customizations c29a6c8 + live config drift), previously never pushed
+- Conflicts: 11 files box-vs-fork, 5 vendor-vs-ours; resolved per runbook defaults
+- Decisions: ADOPT security batch #165 wholesale (log-redact, exfil guard, WarRoom localhost bind, fail-closed migrations); DEFER vendor messenger.ts boot refactor (lands in-tree unreferenced - our src/index.ts boot sequence kept, hook-registry wiring preserved); ADOPT gemini-2.5-flash over box's undocumented gemini-3.5-flash (verify); box branches archived under box/* on the fork
+- Gate: typecheck clean, 848/853 tests pass local (node 24) AND on-host pre-swap gate green
+- Deployed: ts-cc-os-vanilla 2026-07-27 via deploy/update.sh rename-swap; smoke 10/11 pass (11th is issue #20, a smoke-script loopback-probe bug - dashboard verified 200 on its bound tailnet IP)
+- Follow-ups: issue #20 (smoke probe); messenger.ts adoption; gemini model id verification
