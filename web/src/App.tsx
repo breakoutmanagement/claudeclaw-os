@@ -1,5 +1,8 @@
+import { useEffect } from 'preact/hooks';
 import { Route, Switch, Redirect } from 'wouter-preact';
 import { Menu } from 'lucide-preact';
+import { useFetch } from '@/lib/useFetch';
+import { seedAgentNames } from '@/lib/format';
 import { Sidebar } from '@/components/Sidebar';
 import { CommandPalette } from '@/components/CommandPalette';
 import { ToastStack } from '@/components/ToastStack';
@@ -22,6 +25,16 @@ import { DEFAULT_ROUTE } from '@/lib/routes';
 
 export function App() {
   const open = sidebarOpen.value;
+
+  // Seed the global agent-name cache once at app init so every page resolves
+  // display names correctly (e.g. main -> "Holden", not the capitalized id
+  // "Main"). Pages that don't fetch /api/agents themselves — Audit, the Hive
+  // Mind graph — previously fell back to the raw id on a cache miss.
+  const agentList = useFetch<{ agents: { id: string; name?: string }[] }>('/api/agents');
+  useEffect(() => {
+    if (agentList.data?.agents) seedAgentNames(agentList.data.agents);
+  }, [agentList.data]);
+
   return (
     <div class="flex h-screen h-[100dvh] bg-[var(--color-bg)] text-[var(--color-text)]">
       {/* Mobile-only hamburger. Hidden on >=md where the sidebar is

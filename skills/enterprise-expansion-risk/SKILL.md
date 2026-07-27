@@ -142,6 +142,13 @@ Even one-time projects. We don't disappear after handoff.
 **The next project is already mapped.**
 - Deliverable: QBR scheduled before delivery is complete, next engagement scoped in advance
 
+### P5 — Champion Enablement Package (before handoff, not after)
+*(FIX 03 from CAIS Day 09/30: "Handoff was a PDF" — documentation alone cannot answer the CFO.)*
+The champion is our internal sales rep. Arm them like one.
+**Scope it, plan it, price it — a named deliverable, not an afterthought.**
+- Deliverable: Champion Enablement Package — talking points per skeptic, role-played internal pitch, expansion ask scripted
+- Gate check: has the champion delivered the internal pitch once with us in the room (or async walkthrough)?
+
 ---
 
 **If any gate is missing going into a milestone review — stop. Don't proceed to the next phase until it's installed.**

@@ -2,8 +2,27 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { renderCliIndex } from './cli-reference.js';
+import { allDescriptors } from './cli-descriptors.js';
 import { readEnvFile } from './env.js';
 import type { ProviderConfig } from './provider.js';
+
+/**
+ * Append the compact CLI index to an agent's persona so every engine
+ * (Claude-SDK via `systemPrompt`, ACP/openrouter via in-band prepend in
+ * bot.ts) sees the same one source. Only when a persona is present — we do
+ * not fabricate a systemPrompt for no-persona agents. `cli-reference.js` and
+ * `cli-descriptors.js` are both leaf modules (type + pure data only), so this
+ * import does not create a cycle back through db.ts.
+ */
+function withCliIndex(persona: string | undefined): string | undefined {
+  if (!persona) return persona;
+  // Stamp the known-absolute PROJECT_ROOT into the injected index so agents
+  // never rediscover the root via `git rev-parse` — scheduled/automation turns
+  // run from the agent config dir (a non-repo cwd) and would otherwise anchor
+  // to a sibling checkout. See issue #157.
+  return persona + '\n\n' + renderCliIndex(allDescriptors, PROJECT_ROOT);
+}
 
 const envConfig = readEnvFile([
   'TELEGRAM_BOT_TOKEN',
@@ -18,7 +37,6 @@ const envConfig = readEnvFile([
   'DASHBOARD_BIND',
   'DASHBOARD_TOKEN',
   'DASHBOARD_URL',
-  'DASHBOARD_BIND',
   'CLAUDECLAW_CONFIG',
   'DB_ENCRYPTION_KEY',
   'GOOGLE_API_KEY',
@@ -59,6 +77,8 @@ export let agentProvider: ProviderConfig | undefined; // from agent.yaml/main-co
 export let agentObsidianConfig: { vault: string; folders: string[]; readOnly?: string[] } | undefined;
 export let agentSystemPrompt: string | undefined; // loaded from agents/{id}/CLAUDE.md
 export let agentMcpAllowlist: string[] | undefined; // from agent.yaml mcp_servers
+export let agentDisplayName: string | undefined; // from agent.yaml display name
+export let agentCostFooter: CostFooterMode | undefined; // per-agent cost footer override
 
 export function setAgentOverrides(opts: {
   agentId: string;
@@ -69,6 +89,8 @@ export function setAgentOverrides(opts: {
   obsidian?: { vault: string; folders: string[]; readOnly?: string[] };
   systemPrompt?: string;
   mcpServers?: string[];
+  displayName?: string;
+  costFooter?: CostFooterMode;
 }): void {
   AGENT_ID = opts.agentId;
   activeBotToken = opts.botToken;
@@ -76,8 +98,10 @@ export function setAgentOverrides(opts: {
   agentDefaultModel = opts.model;
   agentProvider = opts.provider;
   agentObsidianConfig = opts.obsidian;
-  agentSystemPrompt = opts.systemPrompt;
+  agentSystemPrompt = withCliIndex(opts.systemPrompt);
   agentMcpAllowlist = opts.mcpServers;
+  agentDisplayName = opts.displayName;
+  agentCostFooter = opts.costFooter;
 }
 
 /** Update just the system prompt (CLAUDE.md content). Used by the
@@ -86,7 +110,7 @@ export function setAgentOverrides(opts: {
  *  requiring a process restart. Sub-agents don't need this — the SDK
  *  re-reads CLAUDE.md from cwd via settingSources on every turn. */
 export function updateAgentSystemPrompt(next: string | undefined): void {
-  agentSystemPrompt = next;
+  agentSystemPrompt = withCliIndex(next);
 }
 
 /** Update just the active provider for the running process. Dashboard

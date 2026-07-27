@@ -99,6 +99,10 @@ export function scanForSecrets(text: string, protectedValues?: string[]): Secret
       if (value.length <= 8) continue;
 
       const variants: Array<{ encoded: string; label: string }> = [
+        // Valeur BRUTE d'abord : un secret qui fuit en clair (ex : token Telegram
+        // "12345:AA...") ne correspond a aucune variante encodee ni forcement a un
+        // pattern generique, il faut donc chercher la valeur telle quelle.
+        { encoded: value, label: 'raw' },
         { encoded: Buffer.from(value).toString('base64'), label: 'base64' },
         { encoded: encodeURIComponent(value), label: 'url_encoded' },
       ];

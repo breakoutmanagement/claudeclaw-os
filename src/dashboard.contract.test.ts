@@ -745,6 +745,129 @@ describe('display name resolution', () => {
   });
 });
 
+describe('PUT /api/agents/:id/files/agent-yaml — rename + uniqueness guard', () => {
+  const agentsRoot = path.join(CLAUDECLAW_CONFIG, 'agents');
+  const rakaYaml = path.join(agentsRoot, 'raka', 'agent.yaml');
+
+  beforeEach(() => {
+    for (const [id, name] of [['raka', 'Raka'], ['nova', 'Nova']] as const) {
+      const dir = path.join(agentsRoot, id);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'agent.yaml'),
+        yaml.dump({ name, description: `${name} agent`, telegram_bot_token_env: `${id.toUpperCase()}_BOT_TOKEN` }),
+        'utf-8',
+      );
+    }
+  });
+
+  afterEach(() => {
+    for (const id of ['raka', 'nova']) {
+      try { fs.rmSync(path.join(agentsRoot, id), { recursive: true, force: true }); } catch { /* ok */ }
+    }
+  });
+
+  function putYaml(id: string, obj: Record<string, unknown>) {
+    return app.request(`/api/agents/${id}/files/agent-yaml` + Q, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: yaml.dump(obj) }),
+    });
+  }
+
+  it('appends the outgoing display name to aliases on rename', async () => {
+    const res = await putYaml('raka', {
+      name: 'Rex',
+      description: 'Raka agent',
+      telegram_bot_token_env: 'RAKA_BOT_TOKEN',
+    });
+    expect(res.status).toBe(200);
+
+    const onDisk = yaml.load(fs.readFileSync(rakaYaml, 'utf-8')) as Record<string, unknown>;
+    expect(onDisk.name).toBe('Rex');
+    expect(onDisk.aliases).toContain('Raka');
+  });
+
+  it('rejects a rename that collides with another agent, writing nothing', async () => {
+    const res = await putYaml('raka', {
+      name: 'Nova', // collides with agent "nova"
+      description: 'Raka agent',
+      telegram_bot_token_env: 'RAKA_BOT_TOKEN',
+    });
+    expect(res.status).toBe(409);
+
+    // File on disk is unchanged — still Raka, no alias appended.
+    const onDisk = yaml.load(fs.readFileSync(rakaYaml, 'utf-8')) as Record<string, unknown>;
+    expect(onDisk.name).toBe('Raka');
+    expect(onDisk.aliases).toBeUndefined();
+  });
+
+  it('rejects an alias that collides with another agent', async () => {
+    const res = await putYaml('raka', {
+      name: 'Raka',
+      description: 'Raka agent',
+      telegram_bot_token_env: 'RAKA_BOT_TOKEN',
+      aliases: ['nova'], // collides with agent "nova"
+    });
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('main agent file editor is de-special-cased (normalized shape)', () => {
+  const mainDir = path.join(CLAUDECLAW_CONFIG, 'agents', 'main');
+  const mainYaml = path.join(mainDir, 'agent.yaml');
+  const mainClaudeMd = path.join(mainDir, 'CLAUDE.md');
+  const legacyPersona = path.join(CLAUDECLAW_CONFIG, 'CLAUDE.md');
+
+  beforeEach(() => {
+    fs.mkdirSync(mainDir, { recursive: true });
+    fs.writeFileSync(
+      mainYaml,
+      yaml.dump({ name: 'Holden', description: 'Hub agent', telegram_bot_token_env: 'TELEGRAM_BOT_TOKEN' }),
+      'utf-8',
+    );
+    try { fs.unlinkSync(legacyPersona); } catch { /* absent */ }
+  });
+
+  afterEach(() => {
+    try { fs.rmSync(mainDir, { recursive: true, force: true }); } catch { /* ok */ }
+    try { fs.unlinkSync(legacyPersona); } catch { /* absent */ }
+  });
+
+  it('GET /api/agents/main/files exposes an editable Config tab reading agents/main/agent.yaml', async () => {
+    const res = await get('/api/agents/main/files');
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.config_editable).toBe(true);
+    expect(body.agent_yaml).toContain('name: Holden');
+  });
+
+  it('PUT persona for main writes agents/main/CLAUDE.md, not CLAUDECLAW_CONFIG/CLAUDE.md', async () => {
+    const res = await app.request('/api/agents/main/files/claudemd' + Q, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '# Holden persona\nBe helpful.' }),
+    });
+    expect(res.status).toBe(200);
+    expect(fs.existsSync(mainClaudeMd)).toBe(true);
+    expect(fs.readFileSync(mainClaudeMd, 'utf-8')).toContain('Holden persona');
+    // The dead legacy path is NOT written.
+    expect(fs.existsSync(legacyPersona)).toBe(false);
+  });
+
+  it('PUT agent.yaml for main succeeds (no "edit .env directly" rejection)', async () => {
+    const res = await app.request('/api/agents/main/files/agent-yaml' + Q, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        content: yaml.dump({ name: 'Holden', description: 'Updated hub', telegram_bot_token_env: 'TELEGRAM_BOT_TOKEN' }),
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(fs.readFileSync(mainYaml, 'utf-8')).toContain('Updated hub');
+  });
+});
+
 describe('GET /api/warroom/pin', () => {
   it('returns { ok, agent, mode }', async () => {
     const res = await get('/api/warroom/pin');
