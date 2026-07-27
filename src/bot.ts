@@ -1549,9 +1549,11 @@ export function createBot(): Bot {
   // This prevents message leakage if the bot is added to a group.
   bot.use(async (ctx, next) => {
     if (ctx.chat && ctx.chat.type !== 'private') {
-      logger.warn({ chatId: ctx.chat.id, type: ctx.chat.type }, 'Rejected non-private chat');
-      await ctx.reply('This bot only works in private chats.').catch(() => {});
-      return;
+      // Allow inline-button taps (callback_query) through so features that post
+      // buttons into a group keep working; block free-text to prevent leakage.
+      if (ctx.callbackQuery) { await next(); return; }
+      logger.warn({ chatId: ctx.chat.id, type: ctx.chat.type }, 'Ignored non-private, non-callback update');
+      return; // silent — no spammy "only works in private chats" reply
     }
     await next();
   });

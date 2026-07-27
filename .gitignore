@@ -10,6 +10,9 @@ dist/
 .env.*.bak-rotate
 .env.bak-rotate
 *.bak-rotate
+# Dated/manual .env backups (e.g. .env.bak.20260615) — also full copies with live secrets
+.env.bak.*
+.env.*.bak
 
 # Runtime data — NEVER commit. Contains WhatsApp/Slack messages,
 # session tokens, conversation logs, and database files.
