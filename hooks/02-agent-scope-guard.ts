@@ -10,7 +10,7 @@ import type { HookContext } from '../src/hooks.js';
 import { logger } from '../dist/logger.js';
 
 // Actions that design agents should never perform
-const DESIGN_AGENTS = ['design-system', 'landing-page', 'design-audit', 'visitor-intel'];
+const DESIGN_AGENTS = ['grokeroobot', 'design-system', 'landing-page', 'design-audit', 'visitor-intel'];
 
 const FORBIDDEN_PATTERNS_DESIGN: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /gmail|send.*email|reply.*email|inbox/i, reason: 'Design agents must not access email' },

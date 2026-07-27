@@ -10,6 +10,7 @@ import { logger } from '../dist/logger.js';
 
 // Per-agent daily cost caps (USD). 0 = unlimited.
 const AGENT_DAILY_CAPS: Record<string, number> = {
+  'grokeroobot': 5.0,
   'design-system': 5.0,
   'landing-page': 5.0,
   'design-audit': 5.0,

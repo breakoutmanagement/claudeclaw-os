@@ -13,7 +13,7 @@ STATE_FILE="$PROJECT_ROOT/store/anthropic-scout-state.json"
 CURRENT_FILE="/tmp/anthropic-scout-current-$(date +%s).json"
 
 # Fetch all repos from anthropics org
-gh api orgs/anthropics/repos --paginate \
+FORCE_COLOR=0 CLICOLOR=0 CLICOLOR_FORCE=0 NO_COLOR=1 gh api orgs/anthropics/repos --paginate \
   --jq '[.[] | {name, description, pushed_at, created_at, topics, language, archived, fork, stargazers_count, open_issues_count}]' \
   > "$CURRENT_FILE" 2>/dev/null
 

@@ -45,9 +45,20 @@ restart_tutor() {
   fi
 }
 
+restart_grokeroobot() {
+  echo "Restarting grokeroobot agent..."
+  pkill -f "node.*--agent grokeroobot" 2>/dev/null || true
+  sleep 2
+  cd "$PROJECT"
+  nohup /usr/bin/node dist/index.js --agent grokeroobot >> store/agent-grokeroobot.log 2>&1 &
+  echo $! > store/agent-grokeroobot.pid
+  echo "grokeroobot started (PID: $!)"
+}
+
 case "$TARGET" in
   main)  restart_main ;;
   tutor) restart_tutor ;;
+  grokeroobot) restart_grokeroobot ;;
   all)   restart_main; sleep 2; restart_tutor ;;
-  *)     echo "Usage: $0 [main|tutor|all]"; exit 1 ;;
+  *)     echo "Usage: $0 [main|tutor|grokeroobot|all]"; exit 1 ;;
 esac
